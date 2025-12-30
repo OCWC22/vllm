@@ -274,8 +274,8 @@ Examples:
     # Override model variant if specified
     if args.model_variant:
         model_map = {
-            "2b": "osunlp/MAI-UI-2B",
-            "8b": "osunlp/MAI-UI-8B",
+            "2b": "Tongyi-MAI/MAI-UI-2B",
+            "8b": "Tongyi-MAI/MAI-UI-8B",
         }
         engine_args.model = model_map[args.model_variant]
         

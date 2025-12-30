@@ -47,10 +47,10 @@ def build_server_command(args: argparse.Namespace) -> list[str]:
     if profile is None:
         raise ValueError(f"Unknown profile: {args.profile}")
     
-    # Model paths
+    # Model paths - using official Tongyi-MAI models
     model_paths = {
-        "2b": "osunlp/MAI-UI-2B",
-        "8b": "osunlp/MAI-UI-8B",
+        "2b": "Tongyi-MAI/MAI-UI-2B",
+        "8b": "Tongyi-MAI/MAI-UI-8B",
     }
     
     model = args.model or model_paths.get(profile.model_variant.value)
@@ -151,7 +151,7 @@ Client Example:
   curl http://localhost:8000/v1/chat/completions \\
     -H "Content-Type: application/json" \\
     -d '{
-      "model": "osunlp/MAI-UI-2B",
+      "model": "Tongyi-MAI/MAI-UI-2B",
       "messages": [{
         "role": "user",
         "content": [
@@ -220,7 +220,8 @@ Client Example:
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
-        help="Trust remote code in model",
+        default=True,  # ✅ Required for Qwen2-VL based models
+        help="Trust remote code in model (default: True, required for MAI-UI)",
     )
     parser.add_argument(
         "--check-compatibility",

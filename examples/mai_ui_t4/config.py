@@ -56,7 +56,7 @@ class T4OptimizationConfig:
     # Memory optimization
     # Why: T4 has only 16GB VRAM - every MB counts
     gpu_memory_utilization: float = 0.90  # Reserve 10% for safety
-    max_model_len: int = 4096  # Limit context to reduce KV cache
+    max_model_len: int = 2048  # ✅ Reduced for T4 (saves KV cache memory)
     enforce_eager: bool = True  # Disable CUDA graphs to save ~500MB
     
     # Vision optimization
@@ -77,13 +77,15 @@ class T4OptimizationConfig:
         """Convert to vLLM EngineArgs compatible dict."""
         
         # Select model path based on variant
+        # ✅ CORRECT: Using official Tongyi-MAI model paths
         model_paths = {
-            ModelVariant.MAI_UI_2B: "osunlp/MAI-UI-2B",
-            ModelVariant.MAI_UI_8B: "osunlp/MAI-UI-8B",
+            ModelVariant.MAI_UI_2B: "Tongyi-MAI/MAI-UI-2B",
+            ModelVariant.MAI_UI_8B: "Tongyi-MAI/MAI-UI-8B",
         }
         
         args = {
             "model": model_paths[self.model_variant],
+            "trust_remote_code": True,  # ✅ REQUIRED for Qwen2-VL based models
             "dtype": self.dtype,
             "max_model_len": self.max_model_len,
             "gpu_memory_utilization": self.gpu_memory_utilization,
