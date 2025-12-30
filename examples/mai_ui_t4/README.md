@@ -1,6 +1,14 @@
-# MAI-UI on T4: Optimized vLLM Configuration
+# MAI-UI GPU-Optimized vLLM Configurations
 
-This directory contains production-ready code for running MAI-UI (Qwen2-VL based GUI agent) on NVIDIA T4 GPUs with vLLM.
+This directory contains production-ready code for running MAI-UI (Qwen2-VL based GUI agent) on NVIDIA GPUs with vLLM.
+
+## Supported GPUs
+
+| GPU | Architecture | VRAM | Notebook | Key Features |
+|-----|--------------|------|----------|--------------|
+| **T4** | Turing (SM 7.5) | 16 GB | `mai_ui_t4_colab.ipynb` | Free Colab, FP16 |
+| **H100** | Hopper (SM 9.0) | 80 GB | `h100_colab.ipynb` | FlashAttn2, FP8, BF16 |
+| **B200** | Blackwell (SM 10.0) | 192 GB | `b200_colab.ipynb` | FP4, 4K, 128K context |
 
 ## Architecture Overview
 
@@ -91,6 +99,29 @@ print(action)  # pyautogui.click(500, 300)
 |--------------|------|--------------|-------------------------|
 | MAI-UI-2B FP16 | ~500ms | ~50-65 tok/s | ~1.0s |
 | MAI-UI-8B 4-bit | ~800ms | ~30-40 tok/s | ~1.5s |
+
+## GPU Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        GPU ARCHITECTURE COMPARISON                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Metric              │  T4 (Turing)  │  H100 (Hopper)  │  B200 (Blackwell)     │
+│  ────────────────────┼───────────────┼─────────────────┼───────────────────    │
+│  VRAM                │  16 GB        │  80 GB          │  192 GB               │
+│  Bandwidth           │  320 GB/s     │  3,350 GB/s     │  8,000 GB/s           │
+│  FP16 TFLOPS         │  65           │  1,979          │  ~4,000               │
+│  FP8 TFLOPS          │  ❌           │  3,958          │  ~8,000               │
+│  ────────────────────┼───────────────┼─────────────────┼───────────────────    │
+│  Expected Latency    │  ~1000ms      │  ~200ms         │  ~100ms               │
+│  Expected Throughput │  ~1 req/s     │  ~6 req/s       │  ~15 req/s            │
+│  Max Concurrent      │  4            │  64             │  128                  │
+│  Max Context         │  2K           │  32K            │  128K                 │
+│  Max Resolution      │  720×720      │  1920×1080      │  3840×2160 (4K)       │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## T4 Limitations
 
