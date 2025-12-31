@@ -874,6 +874,210 @@ More tokens = More memory = Longer processing time
 
 ## GPU Hardware Guide
 
+### CUDA Architecture: How GPUs Run Qwen3-VL
+
+Understanding GPU hardware is critical for optimizing vLLM inference. Based on [NVIDIA's Streaming Multiprocessor architecture](https://modal.com/gpu-glossary/device-hardware/streaming-multiprocessor):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     GPU ARCHITECTURE: STREAMING MULTIPROCESSORS (SMs)                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  CPU vs GPU FUNDAMENTAL DIFFERENCE:                                                             │
+│  ══════════════════════════════════                                                             │
+│                                                                                                 │
+│  ┌─────────────────────────────────┐     ┌─────────────────────────────────────────────────┐   │
+│  │         CPU (16 cores)          │     │              GPU (132 SMs on H100)              │   │
+│  │                                 │     │                                                 │   │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐    │     │  ┌───┐┌───┐┌───┐┌───┐┌───┐ ... ┌───┐┌───┐     │   │
+│  │  │CTRL  │ │ ALU  │ │ ALU  │    │     │  │SM ││SM ││SM ││SM ││SM │     │SM ││SM │     │   │
+│  │  │      │ └──────┘ └──────┘    │     │  └───┘└───┘└───┘└───┘└───┘     └───┘└───┘     │   │
+│  │  │      │ ┌──────┐ ┌──────┐    │     │                                               │   │
+│  │  └──────┘ │ ALU  │ │ ALU  │    │     │  Each SM:                                     │   │
+│  │  ┌────────────────────────┐    │     │  • 4 Warp Schedulers                          │   │
+│  │  │      LARGE CACHE       │    │     │  • 32 threads per warp                        │   │
+│  │  │                        │    │     │  • 128 parallel threads per cycle            │   │
+│  │  └────────────────────────┘    │     │                                               │   │
+│  └─────────────────────────────────┘     └─────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  CPU: Complex control, branch prediction, speculative execution, 384 threads max              │
+│  GPU: Simple cores, massive parallelism, 16,000+ parallel threads, 250,000 concurrent        │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  GPU MEMORY HIERARCHY (Critical for PagedAttention):                                            │
+│  ════════════════════════════════════════════════════                                           │
+│                                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                          │   │
+│  │   Per-SM:                                     Per-GPU:                                  │   │
+│  │   ┌──────────────────────────┐               ┌──────────────────────────────────────┐  │   │
+│  │   │ REGISTERS (64KB per SM) │◄── Fastest    │ HBM (High Bandwidth Memory)          │  │   │
+│  │   │ ~2000 per thread        │               │                                      │  │   │
+│  │   └──────────────────────────┘               │  T4:    16 GB  @ 320 GB/s           │  │   │
+│  │   ┌──────────────────────────┐               │  A100:  80 GB  @ 2,039 GB/s         │  │   │
+│  │   │ SHARED MEMORY (192KB)   │◄── Fast       │  H100:  80 GB  @ 3,350 GB/s         │  │   │
+│  │   │ Shared within block      │               │  B200: 192 GB  @ 8,000 GB/s         │  │   │
+│  │   └──────────────────────────┘               │                                      │  │   │
+│  │   ┌──────────────────────────┐               │  KV Cache lives here!               │  │   │
+│  │   │ L1 CACHE (128KB)        │               │  PagedAttention manages this        │  │   │
+│  │   └──────────────────────────┘               └──────────────────────────────────────┘  │   │
+│  │   ┌──────────────────────────┐                                                          │   │
+│  │   │ L2 CACHE (40-60 MB)     │◄── Shared across all SMs                               │   │
+│  │   └──────────────────────────┘                                                          │   │
+│  │                                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### How vLLM Maps to GPU Hardware
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     VLLM PAGEDATTENTION ON GPU ARCHITECTURE                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  PAGEDATTENTION BLOCK TABLE → GPU MEMORY MAPPING:                                               │
+│  ═════════════════════════════════════════════════                                              │
+│                                                                                                 │
+│  vLLM Python Layer:                            CUDA Kernel Layer:                               │
+│  ┌────────────────────────────┐               ┌────────────────────────────────────────────┐   │
+│  │ Block Table                │               │ GPU HBM Memory                             │   │
+│  │ (Virtual → Physical)       │               │                                            │   │
+│  │                            │               │ ┌──────────────────────────────────────┐  │   │
+│  │ Request 0: [P3, P7, P12]   │───────────────┼▶│ Physical Block P3                    │  │   │
+│  │ Request 1: [P1, P5]        │               │ │ K: [256 tokens × 8 heads × 128 dim]  │  │   │
+│  │ Request 2: [P9, P3, P8]    │               │ │ V: [256 tokens × 8 heads × 128 dim]  │  │   │
+│  │           ▲                │               │ └──────────────────────────────────────┘  │   │
+│  │           │                │               │                                            │   │
+│  │           │ Shared block   │               │ ┌──────────────────────────────────────┐  │   │
+│  │           │ (P3 used by    │               │ │ Physical Block P7                    │  │   │
+│  │           │  Req 0 & 2!)   │               │ └──────────────────────────────────────┘  │   │
+│  └────────────────────────────┘               └────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  ATTENTION KERNEL EXECUTION (FlashAttention):                                                   │
+│  ═════════════════════════════════════════════                                                  │
+│                                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                          │   │
+│  │  CUDA Grid Layout (for batch of requests):                                              │   │
+│  │                                                                                          │   │
+│  │  grid = (num_heads, num_seqs, num_kv_splits)                                            │   │
+│  │         └────┬────┘ └────┬───┘ └─────┬─────┘                                            │   │
+│  │              │           │           │                                                   │   │
+│  │              │           │           └─► Split long KV sequences across thread blocks   │   │
+│  │              │           │                                                               │   │
+│  │              │           └─► One block per request in the batch                         │   │
+│  │              │                                                                           │   │
+│  │              └─► One block per attention head (parallel)                                │   │
+│  │                                                                                          │   │
+│  │  ┌─────────────────────────────────────────────────────────────────────────────────┐   │   │
+│  │  │ Thread Block (1 SM handles this):                                               │   │   │
+│  │  │                                                                                  │   │   │
+│  │  │  Warp 0: threads 0-31   ──► Process Q[0:32] × K_block[0:256]                   │   │   │
+│  │  │  Warp 1: threads 32-63  ──► Process Q[32:64] × K_block[0:256]                  │   │   │
+│  │  │  Warp 2: threads 64-95  ──► Process Q[64:96] × K_block[0:256]                  │   │   │
+│  │  │  Warp 3: threads 96-127 ──► Process Q[96:128] × K_block[0:256]                 │   │   │
+│  │  │                                                                                  │   │   │
+│  │  │  Shared Memory: K_block, V_block loaded from HBM once, reused by all warps     │   │   │
+│  │  │  Registers: Each thread holds partial attention scores                          │   │   │
+│  │  └─────────────────────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  vLLM CODE MAPPING (from vllm/v1/attention/backends/flash_attn.py):                            │
+│  ═══════════════════════════════════════════════════════════════════                           │
+│                                                                                                 │
+│  class FlashAttentionBackend:                                                                   │
+│      @classmethod                                                                               │
+│      def supports_compute_capability(cls, capability: DeviceCapability) -> bool:               │
+│          return capability >= DeviceCapability(8, 0)  # SM 8.0+ (A100+)                        │
+│                                                                                                 │
+│  # Compute Capability → GPU Mapping:                                                           │
+│  # SM 7.5 = T4 (Turing)    → FlashInfer or TORCH_SDPA only                                    │
+│  # SM 8.0 = A100 (Ampere)  → FlashAttention 2                                                 │
+│  # SM 9.0 = H100 (Hopper)  → FlashAttention 3 + FP8 + sinks                                   │
+│  # SM 10.0 = B200 (Blackwell) → FlashMLA + FP4                                                │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Attention Backend Selection by GPU
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     VLLM ATTENTION BACKEND SELECTION (from vLLM source code)                    │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  GPU Detection Flow:                                                                            │
+│  ═══════════════════                                                                            │
+│                                                                                                 │
+│  ┌─────────────────┐     ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ torch.cuda.     │     │                                                                 │   │
+│  │ get_device_     │────▶│  DeviceCapability(major, minor)                                 │   │
+│  │ capability()    │     │                                                                 │   │
+│  └─────────────────┘     │  T4:   (7, 5)  →  SM 7.5 (Turing)                              │   │
+│                          │  A100: (8, 0)  →  SM 8.0 (Ampere)                              │   │
+│                          │  H100: (9, 0)  →  SM 9.0 (Hopper)                              │   │
+│                          │  B200: (10, 0) →  SM 10.0 (Blackwell)                          │   │
+│                          └─────────────────────────────────────────────────────────────────┘   │
+│                                           │                                                     │
+│                                           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                         BACKEND PRIORITY SELECTION                                       │   │
+│  ├─────────────────────────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                                          │   │
+│  │  if capability.major >= 8:                    # A100, H100, B200                        │   │
+│  │      try: FlashAttentionBackend               # ← Primary choice                        │   │
+│  │      fallback: FlashInferBackend                                                        │   │
+│  │      fallback: TritonAttentionBackend                                                   │   │
+│  │                                                                                          │   │
+│  │  elif capability.major == 7 and minor >= 5:   # T4                                      │   │
+│  │      try: FlashInferBackend                   # ← T4 primary                            │   │
+│  │      fallback: TritonAttentionBackend                                                   │   │
+│  │      fallback: TORCH_SDPA                     # ← Guaranteed fallback                   │   │
+│  │                                                                                          │   │
+│  │  else:                                                                                   │   │
+│  │      TORCH_SDPA                               # ← Universal fallback                    │   │
+│  │                                                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  BACKEND CAPABILITIES (from vLLM codebase):                                                     │
+│  ══════════════════════════════════════════                                                     │
+│                                                                                                 │
+│  ┌─────────────────┬──────────────────────────────────────────────────────────────────────┐   │
+│  │ Backend         │ Code Location & Capabilities                                         │   │
+│  ├─────────────────┼──────────────────────────────────────────────────────────────────────┤   │
+│  │ FLASH_ATTN      │ vllm/v1/attention/backends/flash_attn.py                            │   │
+│  │                 │ • supports_compute_capability: SM >= 8.0                             │   │
+│  │                 │ • FP8 KV cache: requires flash_attn_supports_fp8()                  │   │
+│  │                 │ • Sinks: requires SM >= 9.0 (H100+)                                 │   │
+│  │                 │ • Block sizes: MultipleOf(16)                                        │   │
+│  ├─────────────────┼──────────────────────────────────────────────────────────────────────┤   │
+│  │ FLASHINFER      │ vllm/v1/attention/backends/flashinfer.py                            │   │
+│  │                 │ • supports_compute_capability: SM 7.5 to 12.1                        │   │
+│  │                 │ • Works on T4! (SM 7.5)                                              │   │
+│  │                 │ • Supported block sizes: [64, 128, 256]                             │   │
+│  ├─────────────────┼──────────────────────────────────────────────────────────────────────┤   │
+│  │ FLASH_MLA       │ vllm/v1/attention/backends/mla/flashmla.py                          │   │
+│  │                 │ • supports_compute_capability: SM in [9, 10] only                    │   │
+│  │                 │ • H100 and B200 only (optimized for MLA heads)                      │   │
+│  ├─────────────────┼──────────────────────────────────────────────────────────────────────┤   │
+│  │ TRITON_ATTN     │ vllm/v1/attention/backends/triton_attn.py                           │   │
+│  │                 │ • supports_compute_capability: All GPUs (returns True)              │   │
+│  │                 │ • Fallback for any GPU                                               │   │
+│  └─────────────────┴──────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Architecture Comparison
 
 ```

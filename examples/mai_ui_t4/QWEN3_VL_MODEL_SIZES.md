@@ -531,6 +531,87 @@ Understanding the fundamental difference between the Qwen3 LLM series (text-only
 
 ---
 
+## GPU Hardware: Streaming Multiprocessors and vLLM
+
+Understanding how CUDA Streaming Multiprocessors (SMs) execute Qwen3-VL inference:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              GPU SM ARCHITECTURE FOR QWEN3-VL INFERENCE                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   GPU SPECIFICATIONS BY ARCHITECTURE:                                                                   │
+│   ═══════════════════════════════════                                                                   │
+│                                                                                                         │
+│   ┌───────────────────┬────────────┬────────────┬────────────┬────────────┬─────────────────────────┐  │
+│   │ Spec              │ T4 (SM7.5) │A100 (SM8.0)│H100 (SM9.0)│B200 (SM10) │ Impact on Qwen3-VL      │  │
+│   ├───────────────────┼────────────┼────────────┼────────────┼────────────┼─────────────────────────┤  │
+│   │ Streaming MPs     │ 40 SMs     │ 108 SMs    │ 132 SMs    │ 192 SMs    │ More SMs = more ||ism  │  │
+│   │ CUDA Cores        │ 2,560      │ 6,912      │ 16,896     │ ~20,000    │ Compute throughput     │  │
+│   │ Tensor Cores      │ 320        │ 432        │ 528        │ ~640       │ Matrix multiply speed  │  │
+│   │ Warp Schedulers   │ 4/SM       │ 4/SM       │ 4/SM       │ 4/SM       │ Thread scheduling      │  │
+│   │ Max Threads/SM    │ 1,024      │ 2,048      │ 2,048      │ 2,048      │ Concurrent warps       │  │
+│   │ Register File     │ 256KB/SM   │ 256KB/SM   │ 256KB/SM   │ 256KB/SM   │ Thread local storage   │  │
+│   │ Shared Memory     │ 64KB/SM    │ 164KB/SM   │ 228KB/SM   │ ~256KB/SM  │ FlashAttn tile size    │  │
+│   │ L2 Cache          │ 4 MB       │ 40 MB      │ 50 MB      │ 64 MB      │ KV cache hot path      │  │
+│   │ Memory BW         │ 320 GB/s   │ 2,039 GB/s │ 3,350 GB/s │ 8,000 GB/s │ Decode speed (bound)   │  │
+│   └───────────────────┴────────────┴────────────┴────────────┴────────────┴─────────────────────────┘  │
+│                                                                                                         │
+│   ─────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                         │
+│   VLLM ATTENTION BACKEND SELECTION (from vllm/platforms/cuda.py):                                      │
+│   ═══════════════════════════════════════════════════════════════                                       │
+│                                                                                                         │
+│   DeviceCapability(major, minor) → Backend Selection:                                                   │
+│                                                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│   │                                                                                                 │  │
+│   │   T4 (7, 5):     FlashInfer (SM 7.5-12.1) → TritonAttn → TORCH_SDPA                           │  │
+│   │                  ⚠️ FlashAttention requires SM >= 8.0, NOT available on T4                     │  │
+│   │                                                                                                 │  │
+│   │   A100 (8, 0):   FlashAttention 2 → FlashInfer → TritonAttn                                   │  │
+│   │                  ✅ Native BF16 Tensor Cores, FP16 accumulate                                  │  │
+│   │                                                                                                 │  │
+│   │   H100 (9, 0):   FlashAttention 3 → FlashMLA → FlashInfer                                     │  │
+│   │                  ✅ FP8 Tensor Cores, FP8 KV cache, sinks support                              │  │
+│   │                                                                                                 │  │
+│   │   B200 (10, 0):  FlashMLA → FlashAttention 3 → FlashInfer                                     │  │
+│   │                  ✅ FP4 (future), 2nd gen Transformer Engine                                   │  │
+│   │                                                                                                 │  │
+│   └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+│   ─────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                         │
+│   PAGEDATTENTION MEMORY MAPPING TO HARDWARE:                                                            │
+│   ══════════════════════════════════════════                                                            │
+│                                                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│   │                                                                                                 │  │
+│   │   vLLM Block Manager          GPU HBM                      CUDA Kernel Execution               │  │
+│   │   ═══════════════════         ═══════                      ═════════════════════               │  │
+│   │                                                                                                 │  │
+│   │   Block Table:                ┌────────────────┐           grid(num_heads, num_seqs, splits)   │  │
+│   │   ┌─────────────────┐         │ Physical Pages │                     │                         │  │
+│   │   │ Seq 0: [P1,P3]  │────────▶│ ┌────┐ ┌────┐ │           ┌─────────▼─────────┐               │  │
+│   │   │ Seq 1: [P2,P3]  │─────┬──▶│ │ P1 │ │ P2 │ │           │ Thread Block 0    │               │  │
+│   │   │ Seq 2: [P4]     │──┐  │   │ └────┘ └────┘ │           │ (on SM 0)         │               │  │
+│   │   └─────────────────┘  │  │   │ ┌────┐ ┌────┐ │           │ Warp 0-3 process  │               │  │
+│   │                        │  └──▶│ │ P3 │ │ P4 │ │◀──────────│ head 0, seq 0     │               │  │
+│   │   P3 SHARED!           │      │ └────┘ └────┘ │           └───────────────────┘               │  │
+│   │   (Copy-on-write)      └─────▶│ (256 tokens   │                                                │  │
+│   │                               │  per page)    │           ┌───────────────────┐               │  │
+│   │   Memory saved: ~50%          └────────────────┘           │ Thread Block 1    │               │  │
+│   │   vs naive allocation                                      │ (on SM 1)         │               │  │
+│   │                                                            │ head 0, seq 1     │               │  │
+│   │                                                            └───────────────────┘               │  │
+│   │                                                                                                 │  │
+│   └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Complete Architecture Diagrams
 
 ### Qwen3-VL Full Model Architecture
