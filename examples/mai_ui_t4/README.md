@@ -54,6 +54,7 @@ python examples/mai_ui_t4/server.py --model-variant 4b-4bit --port 8000
 | File | Description |
 |------|-------------|
 | `QWEN_VL_COMPLETE_GUIDE.md` | **Complete documentation** - Architecture, parameters, optimization |
+| `QWEN3_VL_MODEL_SIZES.md` | **All model sizes** - 2B, 4B, 8B, 32B, MoE breakdown + vLLM configs |
 | `mai_ui_gpu_optimized.ipynb` | **GPU-optimized notebook** - Auto-detects T4/A100/H100/B200 and configures |
 | `gpu_configs.py` | GPU-optimized engine configurations for T4/A100/H100/B200 |
 | `offline_inference.py` | Batch inference script |
