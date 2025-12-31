@@ -54,11 +54,12 @@ python examples/mai_ui_t4/server.py --model-variant 4b-4bit --port 8000
 | File | Description |
 |------|-------------|
 | `QWEN_VL_COMPLETE_GUIDE.md` | **Complete documentation** - Architecture, parameters, optimization |
+| `mai_ui_gpu_optimized.ipynb` | **GPU-optimized notebook** - Auto-detects T4/A100/H100/B200 and configures |
 | `gpu_configs.py` | GPU-optimized engine configurations for T4/A100/H100/B200 |
 | `offline_inference.py` | Batch inference script |
 | `server.py` | OpenAI-compatible API server |
 | `client.py` | GUI agent client library |
-| `mai_ui_t4_colab.ipynb` | Google Colab notebook (T4 optimized) |
+| `mai_ui_t4_colab.ipynb` | Google Colab notebook (T4 only) |
 
 ---
 
