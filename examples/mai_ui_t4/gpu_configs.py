@@ -454,3 +454,4 @@ if __name__ == "__main__":
         print(f"  Max Seqs: {config.max_num_seqs}")
         print(f"  Max Pixels: {config.max_pixels}")
 
+

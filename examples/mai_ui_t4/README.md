@@ -1,132 +1,106 @@
-# MAI-UI GPU-Optimized vLLM Configurations
+# Qwen VL on vLLM: GPU-Optimized Configurations
 
-This directory contains production-ready code for running MAI-UI (Qwen2-VL based GUI agent) on NVIDIA GPUs with vLLM.
+Production-ready code for running Qwen2-VL and Qwen3-VL models on NVIDIA GPUs (T4, A100, H100, B200) with vLLM.
 
-## Supported GPUs
+> 📖 **For detailed documentation, see [QWEN_VL_COMPLETE_GUIDE.md](QWEN_VL_COMPLETE_GUIDE.md)**
 
-| GPU | Architecture | VRAM | Notebook | Key Features |
-|-----|--------------|------|----------|--------------|
-| **T4** | Turing (SM 7.5) | 16 GB | `mai_ui_t4_colab.ipynb` | Free Colab, FP16 |
-| **H100** | Hopper (SM 9.0) | 80 GB | `h100_colab.ipynb` | FlashAttn2, FP8, BF16 |
-| **B200** | Blackwell (SM 10.0) | 192 GB | `b200_colab.ipynb` | FP4, 4K, 128K context |
+---
 
-## Architecture Overview
+## Quick Start
 
+### GPU Selection Matrix
+
+| GPU | VRAM | Best Model | Config |
+|-----|------|------------|--------|
+| **T4** | 16 GB | Qwen3-VL-4B | 4-bit, FP16, 4K context |
+| **A100** | 80 GB | Qwen3-VL-8B | BF16, 32K context |
+| **H100** | 80 GB | Qwen3-VL-8B | FP8, 32K context, high throughput |
+| **B200** | 192 GB | Qwen3-VL-30B | BF16, 128K context |
+
+### Installation
+
+```bash
+pip install vllm transformers
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    MAI-UI + vLLM + T4 OPTIMIZATION STACK                        │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────────────┐  │
-│  │   Screenshot    │    │   vLLM Server   │    │      GUI Agent Client       │  │
-│  │   Input         │ -> │   (Optimized)   │ -> │   (Action Execution)        │  │
-│  │   1920×1080     │    │   T4 @ 16GB     │    │   pyautogui.click(x,y)      │  │
-│  └─────────────────┘    └─────────────────┘    └─────────────────────────────┘  │
-│                                                                                  │
-│  ┌───────────────────────────────────────────────────────────────────────────┐  │
-│  │                         T4 OPTIMIZATIONS APPLIED                           │  │
-│  │  ✅ FP16 (--dtype half)           ✅ PagedAttention (automatic)           │  │
-│  │  ✅ Reduced max_pixels (512K)     ✅ Continuous Batching                   │  │
-│  │  ✅ Limited context (4096)        ✅ Eager mode (memory save)              │  │
-│  │  ✅ 4-bit quantization (8B)       ✅ SDPA attention backend                │  │
-│  └───────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+
+### Run Inference
+
+```bash
+# T4 (Google Colab Free)
+python examples/mai_ui_t4/offline_inference.py \
+    --model-variant 4b-4bit \
+    --image screenshot.png \
+    --instruction "Click the submit button"
+
+# A100/H100
+python examples/mai_ui_t4/offline_inference.py \
+    --model-variant 8b \
+    --image screenshot.png \
+    --instruction "Describe this image"
 ```
+
+### Start Server
+
+```bash
+python examples/mai_ui_t4/server.py --model-variant 4b-4bit --port 8000
+```
+
+---
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `config.py` | T4-optimized engine configurations |
+| `QWEN_VL_COMPLETE_GUIDE.md` | **Complete documentation** - Architecture, parameters, optimization |
+| `config.py` | GPU-optimized engine configurations |
+| `gpu_configs.py` | Detailed configs for T4/A100/H100/B200 |
 | `offline_inference.py` | Batch inference script |
 | `server.py` | OpenAI-compatible API server |
 | `client.py` | GUI agent client library |
 | `colab_notebook.py` | Complete Colab-ready code |
 
-## Quick Start
+### Notebooks
 
-### Option 1: Offline Inference (Batch Processing)
+| Notebook | GPU | Description |
+|----------|-----|-------------|
+| `mai_ui_t4_colab.ipynb` | T4 | Free Colab, 4-bit quantization |
+| `h100_colab.ipynb` | H100 | High throughput, FP8 |
+| `b200_colab.ipynb` | B200 | Maximum context, 4K images |
 
-```bash
-cd /Users/chen/Projects/vllm
-python examples/mai_ui_t4/offline_inference.py \
-    --model-variant 2b \
-    --image screenshot.png \
-    --instruction "Click the submit button"
-```
+---
 
-### Option 2: Online Server
-
-```bash
-cd /Users/chen/Projects/vllm
-python examples/mai_ui_t4/server.py --model-variant 2b --port 8000
-```
-
-### Option 3: Python API
-
-```python
-from examples.mai_ui_t4.client import MAIUIClient
-
-client = MAIUIClient("http://localhost:8000")
-action = client.get_action("screenshot.png", "Click the login button")
-print(action)  # pyautogui.click(500, 300)
-```
-
-## Memory Budget (T4 - 16GB)
+## Performance
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  MAI-UI-2B (FP16):                                                          │
-│  ├── Model Weights:     ~4.0 GB (25%)                                       │
-│  ├── KV Cache:          ~3.0 GB (19%)                                       │
-│  ├── Vision Encoder:    ~1.5 GB (9%)                                        │
-│  ├── Overhead:          ~1.5 GB (9%)                                        │
-│  └── FREE:              ~6.0 GB (38%) ✅ Comfortable                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  MAI-UI-8B (4-bit BitsAndBytes):                                            │
-│  ├── Model Weights:     ~5.0 GB (31%)                                       │
-│  ├── KV Cache:          ~4.0 GB (25%)                                       │
-│  ├── Vision Encoder:    ~2.0 GB (13%)                                       │
-│  ├── Overhead:          ~2.5 GB (16%)                                       │
-│  └── FREE:              ~2.5 GB (15%) ⚠️ Tight                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+GPU         Model            Latency     Throughput    Max Context
+════════════════════════════════════════════════════════════════════
+T4          Qwen3-VL-4B      ~1000ms     ~1 req/s      4K
+A100-80GB   Qwen3-VL-8B      ~300ms      ~4 req/s      32K
+H100        Qwen3-VL-8B+FP8  ~200ms      ~6 req/s      32K
+B200        Qwen3-VL-30B     ~100ms      ~15 req/s     128K
 ```
 
-## Performance Expectations
+---
 
-| Configuration | TTFT | Decode Speed | E2E Latency (30 tokens) |
-|--------------|------|--------------|-------------------------|
-| MAI-UI-2B FP16 | ~500ms | ~50-65 tok/s | ~1.0s |
-| MAI-UI-8B 4-bit | ~800ms | ~30-40 tok/s | ~1.5s |
+## Architecture Comparison
 
-## GPU Comparison
+| Feature | Qwen2-VL | Qwen3-VL |
+|---------|----------|----------|
+| Multi-Scale Features | ❌ | ✅ DeepStack |
+| Video Token Pruning | ❌ | ✅ EVS |
+| MoE Variants | ❌ | ✅ 30B-A3B |
+| Best for GUI Tasks | Good | **Better** (DeepStack detects small UI elements) |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        GPU ARCHITECTURE COMPARISON                               │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  Metric              │  T4 (Turing)  │  H100 (Hopper)  │  B200 (Blackwell)     │
-│  ────────────────────┼───────────────┼─────────────────┼───────────────────    │
-│  VRAM                │  16 GB        │  80 GB          │  192 GB               │
-│  Bandwidth           │  320 GB/s     │  3,350 GB/s     │  8,000 GB/s           │
-│  FP16 TFLOPS         │  65           │  1,979          │  ~4,000               │
-│  FP8 TFLOPS          │  ❌           │  3,958          │  ~8,000               │
-│  ────────────────────┼───────────────┼─────────────────┼───────────────────    │
-│  Expected Latency    │  ~1000ms      │  ~200ms         │  ~100ms               │
-│  Expected Throughput │  ~1 req/s     │  ~6 req/s       │  ~15 req/s            │
-│  Max Concurrent      │  4            │  64             │  128                  │
-│  Max Context         │  2K           │  32K            │  128K                 │
-│  Max Resolution      │  720×720      │  1920×1080      │  3840×2160 (4K)       │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+See [QWEN_VL_COMPLETE_GUIDE.md](QWEN_VL_COMPLETE_GUIDE.md) for detailed architecture comparison.
 
-## T4 Limitations
+---
 
-- ❌ No FlashAttention 2 (uses TORCH_SDPA)
-- ❌ No BF16 (FP16 only)
-- ❌ No FP8 quantization
-- ⚠️ 320 GB/s bandwidth (memory-bound decode)
+## MAI-UI GUI Agent
 
+This codebase supports running [MAI-UI](https://arxiv.org/abs/2512.22047), a state-of-the-art GUI agent that uses Qwen3-VL as its backbone:
+
+- **76.7%** on AndroidWorld (SOTA)
+- **73.5%** on ScreenSpot-Pro
+- Trained with GRPO reinforcement learning
+
+See the complete guide for MAI-UI integration details.
