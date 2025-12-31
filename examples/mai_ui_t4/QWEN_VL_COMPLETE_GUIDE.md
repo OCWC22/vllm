@@ -4,15 +4,50 @@ A comprehensive guide to running Qwen2-VL and Qwen3-VL models on vLLM across dif
 
 ---
 
+## Introduction
+
+Qwen2-VL and Qwen3-VL are successive multimodal large language models from Alibaba's Qwen (Tongyi Qianwen) series, integrating vision and language capabilities. **Qwen2-VL (released 2024)** introduced dynamic image resolution handling and video understanding in a unified architecture. One year later, **Qwen3-VL (2025)** delivered comprehensive upgrades: stronger text and visual reasoning, a **256K token context** (vs ~16K in Qwen2-VL), and improved multimodal alignment.
+
+This guide reviews their architectures and features, covering:
+- **Vision encoders** and backbone integration
+- **Positional encodings** (RoPE, M-RoPE, Interleaved-MRoPE)
+- **Multimodal support** (images & video with DeepStack and Efficient Video Sampling)
+- **Training/inference pipelines** (including GUI agent integration via MAI-UI)
+- **Deployment recommendations** on various GPUs (T4, A100, H100, B200)
+- **vLLM optimization** (PagedAttention, prefix caching, chunked prefill, FlashAttention)
+- **Comparative analysis** of Qwen2-VL vs Qwen3-VL in capabilities, token handling, image resolution, model scales, and latency
+
+---
+
 ## Table of Contents
 
 1. [Quick Reference](#quick-reference)
-2. [How Vision-Language Models Work](#how-vision-language-models-work)
-3. [Qwen2-VL vs Qwen3-VL Architecture](#qwen2-vl-vs-qwen3-vl-architecture)
-4. [GPU Hardware Guide](#gpu-hardware-guide)
-5. [vLLM Configuration Parameters](#vllm-configuration-parameters)
-6. [MAI-UI: GUI Agents with Reinforcement Learning](#mai-ui-gui-agents-with-reinforcement-learning)
-7. [Complete Code Examples](#complete-code-examples)
+2. [Vision-Language Architecture and Components](#vision-language-architecture-and-components)
+   - Encoders and Backbone
+   - Positional Encoding: RoPE and M-RoPE
+   - MLP in Vision Pipeline: Dynamic Token Reduction
+3. [How Vision-Language Models Work](#how-vision-language-models-work)
+4. [Qwen2-VL vs Qwen3-VL Architecture](#qwen2-vl-vs-qwen3-vl-architecture)
+5. [GPU Hardware Guide](#gpu-hardware-guide)
+6. [vLLM Configuration Parameters](#vllm-configuration-parameters)
+7. [MAI-UI: GUI Agents with Reinforcement Learning](#mai-ui-gui-agents-with-reinforcement-learning)
+8. [Multimodal Support: Images, Video, and Advanced Mechanisms](#multimodal-support-images-video-and-advanced-mechanisms)
+   - Unified Image & Video Pipeline
+   - Efficient Video Sampling (EVS)
+   - DeepStack: Multi-Level Vision Features
+9. [Training and Inference Pipelines](#training-and-inference-pipelines)
+   - Three-Stage Training Regimen
+   - Inference Pipeline and vLLM Integration
+10. [Complete Code Examples](#complete-code-examples)
+11. [Comparative Analysis: Qwen2-VL vs Qwen3-VL](#comparative-analysis-qwen2-vl-vs-qwen3-vl)
+    - Capability Improvements
+    - Video Token Handling Comparison
+    - Model Size and Architecture Comparison
+    - Latency and Inference Performance
+    - When to Choose Which Model
+12. [Summary: Key Differences at a Glance](#summary-key-differences-at-a-glance)
+13. [GPU Deployment Best Practices](#gpu-deployment-best-practices)
+14. [References](#references)
 
 ---
 
@@ -43,6 +78,187 @@ A comprehensive guide to running Qwen2-VL and Qwen3-VL models on vLLM across dif
 | Max Video Frames | 14 | 24,576 |
 | Speculative Decoding | Basic | Eagle3 native |
 | MoE Variants | ❌ | ✅ Qwen3-VL-30B-A3B |
+
+---
+
+## Vision-Language Architecture and Components
+
+### Encoders and Backbone
+
+Both Qwen2-VL and Qwen3-VL follow a two-part architecture: a **Vision Transformer (ViT)** as visual encoder feeding into a **transformer-based LLM decoder**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              ENCODER-DECODER ARCHITECTURE                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   ┌───────────────────────────────────┐      ┌───────────────────────────────────────────────┐ │
+│   │       VISION ENCODER (ViT)        │      │              LLM DECODER                      │ │
+│   │        ~675M parameters           │      │         (1.5B - 72B+ parameters)              │ │
+│   │                                   │      │                                               │ │
+│   │  ┌─────────────────────────────┐  │      │  ┌─────────────────────────────────────────┐  │ │
+│   │  │  Patch Embedding (Conv3D)  │  │      │  │  Text Embedding Layer                   │  │ │
+│   │  └──────────────┬──────────────┘  │      │  └─────────────────────────────────────────┘  │ │
+│   │                 │                 │      │                     │                         │ │
+│   │                 ▼                 │      │                     ▼                         │ │
+│   │  ┌─────────────────────────────┐  │      │  ┌─────────────────────────────────────────┐  │ │
+│   │  │   Vision Transformer       │  │      │  │  [visual_tokens] + [text_tokens]        │  │ │
+│   │  │   (32 attention layers)    │  │ ────►│  │       Concatenated sequence             │  │ │
+│   │  └──────────────┬──────────────┘  │      │  └─────────────────────────────────────────┘  │ │
+│   │                 │                 │      │                     │                         │ │
+│   │                 ▼                 │      │                     ▼                         │ │
+│   │  ┌─────────────────────────────┐  │      │  ┌─────────────────────────────────────────┐  │ │
+│   │  │   Patch Merger (MLP)       │  │      │  │  LLM Transformer Layers                 │  │ │
+│   │  │   (Reduces token count)    │  │      │  │  (28-80 layers depending on size)       │  │ │
+│   │  └─────────────────────────────┘  │      │  └─────────────────────────────────────────┘  │ │
+│   │                                   │      │                     │                         │ │
+│   └───────────────────────────────────┘      │                     ▼                         │ │
+│                                              │            Output: Generated Text             │ │
+│                                              └───────────────────────────────────────────────┘ │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Qwen2-VL** uses a ~675M-parameter ViT (vision encoder) across all model sizes:
+- **Qwen2-VL-2B**: 675M ViT + 1.5B LLM = ~2.2B total parameters
+- **Qwen2-VL-7B**: 675M ViT + 7.6B LLM = ~8.3B total parameters
+- **Qwen2-VL-72B**: 675M ViT + 72B LLM = ~72.7B total parameters
+
+**Qwen3-VL** upgrades the text backbone to the Qwen3 series with additional architectural innovations:
+- Dense models: 2B, 4B, 8B, 32B
+- MoE models: 30B-A3B (30B total, 3B active), 235B-A22B (235B total, 22B active)
+- **DeepStack**: Fuses multi-level ViT features into the LLM at multiple layers
+- Same vision encoder front-end, but with learned position embeddings + interpolation
+
+### Positional Encoding: RoPE and M-RoPE
+
+Qwen models use **Rotary Position Embeddings (RoPE)** to represent token positions. Qwen2-VL innovated **Multimodal RoPE (M-RoPE)** to handle 2D spatial and 3D temporal positions beyond 1D text.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              M-ROPE: MULTIMODAL ROTARY POSITION EMBEDDING                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  STANDARD 1D RoPE (Text Only):                                                                  │
+│  ══════════════════════════════                                                                 │
+│                                                                                                 │
+│    Token:    [The]  [cat]  [sat]  [on]  [the]  [mat]                                           │
+│    Position:   0      1      2     3      4      5                                              │
+│                                                                                                 │
+│    Each position gets a single rotation angle applied to embeddings.                           │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  M-ROPE (Qwen2-VL): FACTORIZED INTO 3 COMPONENTS                                                │
+│  ════════════════════════════════════════════════                                               │
+│                                                                                                 │
+│    For TEXT tokens: All three components use the same position index                           │
+│    ┌─────────────────────────────────────────────────────────────────────┐                     │
+│    │  Temporal ID: 0  0  0  0  0  0                                      │                     │
+│    │  Height ID:   0  1  2  3  4  5  (same as 1D position)              │                     │
+│    │  Width ID:    0  1  2  3  4  5  (same as 1D position)              │                     │
+│    └─────────────────────────────────────────────────────────────────────┘                     │
+│    → Reduces to normal 1D RoPE for text                                                        │
+│                                                                                                 │
+│    For IMAGE tokens: Constant temporal, varying height/width                                   │
+│    ┌─────────────────────────────────────────────────────────────────────┐                     │
+│    │  Image patches in a 3×3 grid:                                       │                     │
+│    │                                                                      │                     │
+│    │    Patch:      P00  P01  P02  P10  P11  P12  P20  P21  P22          │                     │
+│    │    Temporal:    0    0    0    0    0    0    0    0    0           │                     │
+│    │    Height:      0    0    0    1    1    1    2    2    2           │                     │
+│    │    Width:       0    1    2    0    1    2    0    1    2           │                     │
+│    └─────────────────────────────────────────────────────────────────────┘                     │
+│    → 2D spatial encoding for images                                                            │
+│                                                                                                 │
+│    For VIDEO tokens: Increasing temporal, varying height/width per frame                       │
+│    ┌─────────────────────────────────────────────────────────────────────┐                     │
+│    │  Frame 0:     Temporal=0, Height=[0-H], Width=[0-W]                 │                     │
+│    │  Frame 1:     Temporal=1, Height=[0-H], Width=[0-W]                 │                     │
+│    │  Frame 2:     Temporal=2, Height=[0-H], Width=[0-W]                 │                     │
+│    │  ...                                                                 │                     │
+│    └─────────────────────────────────────────────────────────────────────┘                     │
+│    → 3D spatiotemporal encoding for videos                                                     │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  INTERLEAVED M-ROPE (Qwen3-VL): FULL-FREQUENCY ALLOCATION                                       │
+│  ═════════════════════════════════════════════════════════                                      │
+│                                                                                                 │
+│    Enhancement: Distributes RoPE's frequency spectrum across all 3 axes                        │
+│                                                                                                 │
+│    Standard M-RoPE:   [freq_0-31: time] [freq_32-63: height] [freq_64-95: width]              │
+│    Interleaved:       [freq interleaved across time, height, width uniformly]                 │
+│                                                                                                 │
+│    BENEFIT: All frequencies contribute across dimensions, mitigating single-axis dominance    │
+│    RESULT: Improved video reasoning over long sequences                                        │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  TEXT-TIMESTAMP ALIGNMENT (Qwen3-VL Only):                                                      │
+│  ═════════════════════════════════════════                                                      │
+│                                                                                                 │
+│    Instead of implicit temporal RoPE, Qwen3-VL injects explicit textual time tags:            │
+│                                                                                                 │
+│    [frame_0] <@ 0.0 seconds> [frame_1] <@ 0.5 seconds> [frame_2] <@ 1.0 seconds> ...          │
+│                                                                                                 │
+│    BENEFIT: More precise temporal grounding for video events                                   │
+│    OUTPUT: Model can say "At <@ 5.0s>, a cat enters the scene"                                │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Benefits of M-RoPE:**
+- Position IDs for height/width remain much smaller than if the image were flattened
+- Reduces position index magnitude, allowing extrapolation to longer sequences
+- Qwen2-VL's 72B demonstrates robust length generalization on video inputs >16K tokens (~20 min video)
+
+### MLP in Vision Pipeline: Dynamic Token Reduction
+
+Both generations include an MLP component to reduce visual token length after the ViT encoder.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              NAIVE DYNAMIC RESOLUTION                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  PROBLEM: Prior LVLMs resized all images to 224×224, losing detail in large images            │
+│                                                                                                 │
+│  SOLUTION: Process images at NATIVE resolution, then compress adaptively                       │
+│                                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │  Example Inputs and Their Token Counts:                                                  │   │
+│  │                                                                                          │   │
+│  │  ┌────────────────────┐  ┌──────────┐  ┌──────────────┐  ┌────────────────────────────┐ │   │
+│  │  │ Picture 1          │  │Picture 2 │  │  Picture 3   │  │  Video 1 (10s @ 2fps)      │ │   │
+│  │  │ 8204×1092          │  │ 28×224   │  │  448×448     │  │  20 frames × 448×448       │ │   │
+│  │  │ (Tall webpage)     │  │ (Tiny)   │  │  (Standard)  │  │                            │ │   │
+│  │  │                    │  │          │  │              │  │                            │ │   │
+│  │  │ ViT: ~65K patches  │  │ ~4 ptch  │  │ ~1K patches  │  │  ~20K patches              │ │   │
+│  │  │ After MLP: 11,427  │  │    8     │  │    256       │  │  5,000 tokens              │ │   │
+│  │  └────────────────────┘  └──────────┘  └──────────────┘  └────────────────────────────┘ │   │
+│  │                                                                                          │   │
+│  │  HIGH-RES = MORE TOKENS          LOW-RES = FEWER TOKENS                                 │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  HOW IT WORKS:                                                                                  │
+│  ══════════════                                                                                 │
+│                                                                                                 │
+│    1. ViT processes image at native resolution (patch size 14×14)                              │
+│    2. Produces patch sequence proportional to image size                                       │
+│    3. MLP merges adjacent patches to reduce sequence length                                    │
+│    4. Special tokens mark visual boundaries: <vision_start> ... <vision_end>                  │
+│                                                                                                 │
+│  QWEN3-VL ENHANCEMENT:                                                                          │
+│  ═════════════════════                                                                          │
+│                                                                                                 │
+│    DeepStack means multi-scale information from early ViT layers is preserved:                │
+│    • Early layers: Fine details (edges, textures, small text)                                 │
+│    • Later layers: Semantic concepts (object types, relationships)                            │
+│    • Both scales available to LLM → Better fine-grained understanding                         │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -1306,6 +1522,404 @@ MAI-UI is a family of GUI agents developed by Tongyi Lab (Alibaba) that uses Qwe
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## Multimodal Support: Images, Video, and Advanced Mechanisms
+
+### Unified Image & Video Pipeline
+
+A hallmark of Qwen2-VL was treating video within the same architecture as images (rather than requiring a separate video-specific model).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              UNIFIED IMAGE & VIDEO PROCESSING                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  QWEN2-VL VIDEO APPROACH:                                                                       │
+│  ════════════════════════                                                                       │
+│                                                                                                 │
+│    1. Sample videos at 2 frames per second (2 Hz) during training/inference                   │
+│    2. Apply 3D convolutions of depth 2 on adjacent frames' patches                            │
+│    3. Creates "spatiotemporal tube" patches spanning 2 consecutive frames                     │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │                                                                                        │   │
+│    │   Frame t    Frame t+1                  3D Conv (depth=2)                             │   │
+│    │   ┌─────┐    ┌─────┐                    ┌─────────────────┐                           │   │
+│    │   │patch│    │patch│  ──────────────►   │ Spatiotemporal  │                           │   │
+│    │   │ (i) │    │ (i) │                    │   Tube Patch    │                           │   │
+│    │   └─────┘    └─────┘                    └─────────────────┘                           │   │
+│    │                                                                                        │   │
+│    │   BENEFIT: Motion features encoded without exploding sequence length                  │   │
+│    │   Combining 2 frames into 1 patch HALVES the token count per temporal unit            │   │
+│    │                                                                                        │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│    • Every IMAGE is treated as two identical frames (fits the 3D scheme)                      │
+│    • Max visual tokens per video: 16,384 during training                                      │
+│    • With patch merging: supports videos ~20+ minutes in length                               │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  QWEN3-VL VIDEO ENHANCEMENTS:                                                                   │
+│  ════════════════════════════                                                                   │
+│                                                                                                 │
+│    • Native 256K token context window for interleaved text+images+video                       │
+│    • Can process HOURS-long videos with transcripts or frame-by-frame descriptions            │
+│    • "Second-level indexing" - pinpoint events at specific time offsets accurately            │
+│                                                                                                 │
+│    Text-Timestamp Alignment:                                                                    │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │  [frame_0] <@ 0.0 seconds>                                                             │   │
+│    │  [frame_1] <@ 0.5 seconds>                                                             │   │
+│    │  [frame_2] <@ 1.0 seconds>                                                             │   │
+│    │  ...                                                                                    │   │
+│    │  [frame_N] <@ 120.0 seconds>                                                           │   │
+│    │                                                                                        │   │
+│    │  Model can output: "At <@ 5.0s>, a cat enters the scene"                              │   │
+│    │  Model can answer: "What happened between 00:10 and 00:20 in the video?"              │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│    • Ranks #1 on MMMU (Massive Multimodal Multitask Unified benchmark)                        │
+│    • Excels at visual mathematical reasoning (MathVista, MathVision)                          │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Efficient Video Sampling (EVS) - Deep Dive
+
+EVS is a plug-and-play method to prune redundant tokens by detecting static patches across frames.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              EVS: EFFICIENT VIDEO SAMPLING (DETAILED)                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  HOW EVS WORKS:                                                                                 │
+│  ══════════════                                                                                 │
+│                                                                                                 │
+│  1. COMPUTE PATCH SIMILARITY: For each patch position, compare across adjacent frames         │
+│                                                                                                 │
+│     Frame t    Frame t+1    Similarity                                                         │
+│     ┌─────┐    ┌─────┐                                                                         │
+│     │ 0.8 │    │ 0.8 │  →  0.99 (nearly identical, PRUNE)                                     │
+│     └─────┘    └─────┘                                                                         │
+│     ┌─────┐    ┌─────┐                                                                         │
+│     │ cat │    │ dog │  →  0.15 (very different, KEEP)                                        │
+│     └─────┘    └─────┘                                                                         │
+│                                                                                                 │
+│  2. THRESHOLD-BASED PRUNING: Patches above similarity threshold are merged                    │
+│                                                                                                 │
+│  3. POSITION-AWARE PRESERVATION: Maintains original RoPE indices for retained patches         │
+│     • The model can still attend correctly to the compressed sequence                         │
+│     • Spatial relationships preserved even after pruning                                      │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  EXAMPLE: SURVEILLANCE VIDEO                                                                    │
+│  ════════════════════════════                                                                   │
+│                                                                                                 │
+│    Input: 5-minute hallway surveillance (600 frames @ 2fps)                                    │
+│                                                                                                 │
+│    Without EVS:                                                                                 │
+│    ┌─────────────────────────────────────────────────────────────────────────────────────┐    │
+│    │ Frame 1 ██ Frame 2 ██ Frame 3 ██ ... Frame 600 ██                                   │    │
+│    │ ALL frames processed → 96,000 tokens → OOM on most GPUs!                            │    │
+│    └─────────────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                                 │
+│    With EVS (75% pruning):                                                                     │
+│    ┌─────────────────────────────────────────────────────────────────────────────────────┐    │
+│    │ Frame 1 ██ Frame 2 ░░ Frame 3 ░░ Frame 4 ██ ... (only motion frames kept)          │    │
+│    │ 150 frames kept → 24,000 tokens → Fits on A100!                                    │    │
+│    └─────────────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  PERFORMANCE BENCHMARKS (From NVIDIA Research):                                                 │
+│  ═══════════════════════════════════════════════                                                │
+│                                                                                                 │
+│  ┌────────────────────┬──────────────────┬────────────────────┬─────────────────────────────┐  │
+│  │ Video Type         │ Pruning Rate     │ Accuracy Loss      │ Speed Improvement           │  │
+│  ├────────────────────┼──────────────────┼────────────────────┼─────────────────────────────┤  │
+│  │ Static scenes      │ 75%              │ <1%                │ 4× faster                   │  │
+│  │ (surveillance)     │                  │                    │                             │  │
+│  ├────────────────────┼──────────────────┼────────────────────┼─────────────────────────────┤  │
+│  │ Moderate motion    │ 50%              │ 1-2%               │ 2× faster                   │  │
+│  │ (lectures, talks)  │                  │                    │                             │  │
+│  ├────────────────────┼──────────────────┼────────────────────┼─────────────────────────────┤  │
+│  │ High motion        │ 30%              │ 2-3%               │ 1.4× faster                 │  │
+│  │ (sports, action)   │                  │                    │                             │  │
+│  └────────────────────┴──────────────────┴────────────────────┴─────────────────────────────┘  │
+│                                                                                                 │
+│  VLLM INTEGRATION:                                                                              │
+│  ═════════════════                                                                              │
+│                                                                                                 │
+│    Enable EVS with: --video-pruning-rate 0.5                                                   │
+│                                                                                                 │
+│    mm_processor_kwargs={                                                                        │
+│        "video_pruning_rate": 0.5,  # Prune 50% of similar frames                               │
+│    }                                                                                            │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### DeepStack: Multi-Level Vision Features
+
+DeepStack creates multiple entry points for visual features in the LLM decoder.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              DEEPSTACK: MULTI-LEVEL FEATURE FUSION                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  THE PROBLEM WITH SINGLE-LAYER OUTPUT:                                                          │
+│  ══════════════════════════════════════                                                         │
+│                                                                                                 │
+│    Standard approach: Only FINAL ViT layer output feeds into LLM                               │
+│                                                                                                 │
+│    ViT Layer 0  → Layer 8  → Layer 16 → Layer 24 → Layer 32 → [Output] → LLM                  │
+│       edges       shapes      patterns   objects    concepts                                    │
+│       textures                                                                                  │
+│                                                                                                 │
+│    PROBLEM: Fine details from early layers get "washed out" by deeper layers                  │
+│             Small text, thin lines, subtle edges are LOST                                      │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  DEEPSTACK SOLUTION (Qwen3-VL):                                                                 │
+│  ══════════════════════════════                                                                 │
+│                                                                                                 │
+│    Extract features at MULTIPLE layers and inject them into corresponding LLM layers          │
+│                                                                                                 │
+│    ViT Layer 8  ──────────────────────────────────────────────────────► LLM Layer 0           │
+│         │                                                                    │                  │
+│         │  (edge/texture features)                                           │                  │
+│         │                                                                    ▼                  │
+│    ViT Layer 16 ──────────────────────────────────────────────────────► LLM Layer 1           │
+│         │                                                                    │                  │
+│         │  (shape/structure features)                                        │                  │
+│         │                                                                    ▼                  │
+│    ViT Layer 24 ──────────────────────────────────────────────────────► LLM Layer 2           │
+│         │                                                                    │                  │
+│         │  (pattern/widget features)                                         │                  │
+│         │                                                                    ▼                  │
+│    ViT Layer 32 ─────► Main Merger ──────────────────────────────────► LLM Embedding          │
+│                        (semantic features)                                                      │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  IMPLEMENTATION DETAILS:                                                                        │
+│  ═══════════════════════                                                                        │
+│                                                                                                 │
+│    # Vision encoder outputs multi-scale features                                               │
+│    deepstack_visual_indexes = [8, 16, 24]  # Which ViT layers to extract                      │
+│                                                                                                 │
+│    # Output format from vision encoder:                                                         │
+│    vision_output = [main_emb | ds_emb_0 | ds_emb_1 | ds_emb_2]                                 │
+│                                                                                                 │
+│    # Split into components:                                                                     │
+│    multimodal_embeddings_main = output[:, :visual_dim]        # Final layer                   │
+│    multimodal_embeddings_multiscale = output[:, visual_dim:]  # Early layers                  │
+│                                                                                                 │
+│    # Inject into early LLM layers:                                                              │
+│    for layer_idx, layer in enumerate(self.layers):                                             │
+│        hidden_states = layer(hidden_states)                                                     │
+│        if layer_idx < len(deepstack_features):                                                 │
+│            hidden_states = hidden_states + deepstack_features[layer_idx]                       │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  BENEFITS FOR DIFFERENT TASKS:                                                                  │
+│  ══════════════════════════════                                                                 │
+│                                                                                                 │
+│    GUI Agents:                                                                                  │
+│    • Layer 8 features: Button borders, icon edges → Precise click targets                     │
+│    • Layer 16 features: UI component shapes → Widget identification                           │
+│    • Layer 24 features: Layout patterns → Navigation understanding                            │
+│                                                                                                 │
+│    Document OCR:                                                                                │
+│    • Layer 8 features: Character strokes, thin lines → Small text recognition                │
+│    • Layer 16 features: Word boundaries, table cells → Layout parsing                         │
+│    • Layer 24 features: Section headers, diagrams → Document structure                        │
+│                                                                                                 │
+│    Medical Imaging:                                                                             │
+│    • Layer 8 features: Tissue textures, fine structures → Lesion detection                   │
+│    • Layer 16 features: Organ boundaries → Anatomical localization                            │
+│    • Layer 24 features: Pathological patterns → Diagnosis support                             │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Training and Inference Pipelines
+
+### Three-Stage Training Regimen
+
+Both Qwen2-VL and Qwen3-VL follow a multi-stage training strategy:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              THREE-STAGE TRAINING PIPELINE                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  STAGE 1: VISION ENCODER ALIGNMENT                                                              │
+│  ═════════════════════════════════                                                              │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │  Goal: Teach ViT to produce embeddings the LLM can understand                        │   │
+│    │                                                                                        │   │
+│    │  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐                         │   │
+│    │  │  ViT Encoder │      │  Projection  │      │  LLM (frozen)│                         │   │
+│    │  │  (trainable) │  →   │  Layer       │  →   │              │                         │   │
+│    │  └──────────────┘      └──────────────┘      └──────────────┘                         │   │
+│    │                                                                                        │   │
+│    │  Data: Image-text pairs, image captioning, OCR data                                   │   │
+│    │  Objective: Align visual representations with language model embedding space         │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  STAGE 2: JOINT MULTIMODAL TRAINING                                                             │
+│  ══════════════════════════════════                                                             │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │  Goal: Learn to reason across images, videos, and text together                      │   │
+│    │                                                                                        │   │
+│    │  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐                         │   │
+│    │  │  ViT Encoder │      │  Projection  │      │     LLM      │                         │   │
+│    │  │  (trainable) │  →   │  Layer       │  →   │  (trainable) │                         │   │
+│    │  └──────────────┘      └──────────────┘      └──────────────┘                         │   │
+│    │                                                                                        │   │
+│    │  Data:                                                                                 │   │
+│    │  • Image-text pairs (captioning, VQA)                                                 │   │
+│    │  • Interleaved text with images (documents, webpages)                                 │   │
+│    │  • Video dialogues (temporal reasoning)                                               │   │
+│    │  • Image knowledge datasets (world knowledge)                                         │   │
+│    │                                                                                        │   │
+│    │  Objective: Next-token prediction on multimodal sequences                            │   │
+│    │  Scale: Qwen2-VL investigated scaling laws → bigger model + more data = better       │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│  STAGE 3: INSTRUCTION FINE-TUNING (RLHF/SFT)                                                    │
+│  ═══════════════════════════════════════════                                                    │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │  Goal: Align model with human preferences and instruction following                  │   │
+│    │                                                                                        │   │
+│    │  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐                         │   │
+│    │  │  ViT Encoder │      │  Projection  │      │     LLM      │                         │   │
+│    │  │   (frozen)   │  →   │  Layer       │  →   │  (trainable) │                         │   │
+│    │  └──────────────┘      └──────────────┘      └──────────────┘                         │   │
+│    │                                                                                        │   │
+│    │  Methods: RLHF (Reinforcement Learning from Human Feedback)                           │   │
+│    │           SFT (Supervised Fine-Tuning on instruction data)                            │   │
+│    │                                                                                        │   │
+│    │  Qwen3-VL Variants:                                                                    │   │
+│    │  • Instruct: Polite, safety-aligned, follows user instructions                       │   │
+│    │  • Thinking: Enhanced reasoning, less filtered, for complex tasks                    │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Inference Pipeline and vLLM Integration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              VLLM INFERENCE ARCHITECTURE                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  PAGEDATTENTION: EFFICIENT KV CACHE MANAGEMENT                                                  │
+│  ═══════════════════════════════════════════════                                                │
+│                                                                                                 │
+│    Problem: Standard KV cache allocates one giant contiguous tensor                            │
+│             → Memory fragmentation with variable-length prompts                                │
+│             → Can't share KV cache between requests with common prefixes                       │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │  NAIVE KV CACHE (Wasteful)            PAGEDATTENTION (Efficient)                      │   │
+│    │                                                                                        │   │
+│    │  Request 1: [████████░░░░░░░░░░░░]    Request 1: [█][█][█]                            │   │
+│    │  Request 2: [██████████████░░░░░░]    Request 2: [█][█][█][█][█]                      │   │
+│    │  Request 3: [██░░░░░░░░░░░░░░░░░░]    Request 3: [█]                                  │   │
+│    │                                                                                        │   │
+│    │  Wasted: 60% of allocated memory      Wasted: <5% (small fragmentation)              │   │
+│    │                                                                                        │   │
+│    │  Each [█] = 256 tokens of KV cache (one "page")                                       │   │
+│    │  Pages allocated on-demand, freed when request completes                              │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│    Benefits:                                                                                    │
+│    • 2.5×–5× less memory overhead compared to naive caching                                   │
+│    • Supports far more concurrent requests                                                     │
+│    • Enables efficient sharing of prefix KV segments                                          │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  AUTOMATIC PREFIX CACHING                                                                       │
+│  ════════════════════════                                                                       │
+│                                                                                                 │
+│    If multiple requests share the same initial tokens (system prompt),                        │
+│    reuse the previously computed KV cache for that prefix.                                    │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │                                                                                        │   │
+│    │  Request 1: [System Prompt: You are a GUI agent...] + [User: Click settings]         │   │
+│    │             └──────────── CACHED ────────────────┘   └───── NEW ─────────┘            │   │
+│    │                                                                                        │   │
+│    │  Request 2: [System Prompt: You are a GUI agent...] + [User: Open browser]           │   │
+│    │             └──────────── REUSED ────────────────┘   └───── NEW ─────────┘            │   │
+│    │                                                                                        │   │
+│    │  Request 2 skips computing KV cache for 500 tokens → Much faster!                    │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│    Enable: enable_prefix_caching=True                                                          │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  CHUNKED PREFILL (STREAMED PREFILL)                                                             │
+│  ══════════════════════════════════                                                             │
+│                                                                                                 │
+│    Problem: Long input (50K tokens) must be fully encoded before any output                   │
+│    Solution: Process in chunks, start generation before prefill completes                     │
+│                                                                                                 │
+│    ┌───────────────────────────────────────────────────────────────────────────────────────┐   │
+│    │                                                                                        │   │
+│    │  STANDARD PREFILL:                                                                     │   │
+│    │  [Encode 50K tokens ─────────────────────────────────────] → [Start generating]       │   │
+│    │                              Long wait time                                           │   │
+│    │                                                                                        │   │
+│    │  CHUNKED PREFILL:                                                                      │   │
+│    │  [Encode 5K] → [Start generating partial] → [Continue encoding 45K in background]    │   │
+│    │       │                                                                                │   │
+│    │       └──► User sees first tokens ~30% faster!                                        │   │
+│    │                                                                                        │   │
+│    └───────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│    Enable: enable_chunked_prefill=True                                                         │
+│    Critical for Qwen3-VL's 256K context window                                                 │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  FLASHATTENTION INTEGRATION                                                                     │
+│  ══════════════════════════                                                                     │
+│                                                                                                 │
+│    Qwen3-VL recommends: attn_implementation="flash_attention_2"                                │
+│                                                                                                 │
+│    FlashAttention uses CUDA kernels to compute attention with:                                 │
+│    • Lower memory usage (no full attention matrix materialization)                            │
+│    • Higher throughput (kernel fusion, memory hierarchy optimization)                         │
+│    • Critical for multi-image and video scenarios                                              │
+│                                                                                                 │
+│    Requirements:                                                                                │
+│    • SM 8.0+ for FlashAttention 2 (A100, H100)                                                │
+│    • SM 9.0+ for FlashAttention 3 (H100, B200)                                                │
+│    • T4 (SM 7.5): Falls back to TORCH_SDPA                                                    │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ### Why Qwen3-VL is Ideal for GUI Agents
 
 ```
@@ -1733,6 +2347,269 @@ if __name__ == "__main__":
 
 ---
 
+## Comparative Analysis: Qwen2-VL vs Qwen3-VL
+
+### Capability Improvements
+
+Qwen3-VL is a major leap over Qwen2-VL in both breadth and depth of abilities:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              CAPABILITY COMPARISON                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  LANGUAGE ABILITY                                                                               │
+│  ════════════════                                                                               │
+│  • Qwen2-VL: Based on Qwen2 backbone, strong but not matching text-only LLMs                  │
+│  • Qwen3-VL: "Surpasses comparable text-only backbones" on some NLP tasks                     │
+│              Better training + MoE scaling = competitive even without images                   │
+│                                                                                                 │
+│  MULTILINGUAL OCR                                                                               │
+│  ═════════════════                                                                              │
+│  • Qwen2-VL: ~10 languages supported                                                          │
+│  • Qwen3-VL: 32 languages supported (3× expansion)                                            │
+│                                                                                                 │
+│  MATH & STEM REASONING                                                                          │
+│  ═════════════════════                                                                          │
+│  • Qwen2-VL: Good at DocVQA (tables, math in documents)                                       │
+│  • Qwen3-VL: State-of-the-art on MathVista, MathVision                                        │
+│              Excels at visual math problems (charts, equations from images)                    │
+│                                                                                                 │
+│  AGENTIC CAPABILITIES                                                                           │
+│  ════════════════════                                                                           │
+│  • Qwen2-VL: Suggested integration with robots (not demonstrated)                             │
+│  • Qwen3-VL: Full "Visual Agent" capability                                                   │
+│              - Operates PC/mobile GUIs                                                         │
+│              - Recognizes elements, understands functions                                      │
+│              - Invokes tools, completes tasks                                                  │
+│              - Writes HTML/CSS from design images                                              │
+│                                                                                                 │
+│  BENCHMARK PERFORMANCE                                                                          │
+│  ═════════════════════                                                                          │
+│  • Qwen2-VL-72B: Comparable to GPT-4o and Claude 3.5 Sonnet                                   │
+│  • Qwen3-VL: #1 on MMMU leaderboard (late 2025)                                               │
+│              State-of-the-art across vision, language, and temporal reasoning                 │
+│                                                                                                 │
+│  VISUAL RECOGNITION                                                                             │
+│  ══════════════════                                                                             │
+│  • Qwen2-VL: Good general recognition                                                         │
+│  • Qwen3-VL: "Recognizes everything" - celebrities, anime, products,                          │
+│              landmarks, flora/fauna, niche categories                                          │
+│              Improved robustness to low-light, blur, tilted imagery                           │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Video Token Handling Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              VIDEO HANDLING COMPARISON                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  ┌──────────────────────────┬──────────────────────────────┬────────────────────────────────┐  │
+│  │ Feature                  │ Qwen2-VL                     │ Qwen3-VL                       │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Native Context           │ ~16K tokens                  │ 256K tokens (16× larger)       │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Max Video Length         │ ~20 minutes                  │ ~2+ hours at 2fps              │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Temporal Understanding   │ Implicit via M-RoPE          │ Explicit timestamp tokens      │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Event Localization       │ General answers              │ "At <@5.0s>, X happens"       │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ EVS Support              │ Not available at release     │ Full support via vLLM          │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Efficiency on Static     │ Process all frames           │ 75% pruning with EVS           │  │
+│  │ Videos                   │                              │                                │  │
+│  ├──────────────────────────┼──────────────────────────────┼────────────────────────────────┤  │
+│  │ Expandable Context       │ Limited extrapolation        │ Up to 1M with fine-tuning      │  │
+│  └──────────────────────────┴──────────────────────────────┴────────────────────────────────┘  │
+│                                                                                                 │
+│  PRACTICAL EXAMPLE:                                                                             │
+│  ══════════════════                                                                             │
+│                                                                                                 │
+│    2-hour video at 2fps = 14,400 frames                                                         │
+│    Each frame ~10 tokens after merging = 144,000 tokens                                        │
+│                                                                                                 │
+│    Qwen2-VL: Would need to skip frames or truncate → loses information                        │
+│    Qwen3-VL: Fits within 256K context → full video understanding                              │
+│              With EVS 50%: Only 72,000 tokens → even faster                                   │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Model Size and Architecture Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              MODEL VARIANTS AND HARDWARE REQUIREMENTS                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  ┌──────────────────────┬───────────────────┬──────────────┬────────────────────────────────┐  │
+│  │ Model                │ Param Count       │ Precision    │ Min Hardware                   │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen2-VL-2B          │ 2.2B (1.5B LLM +  │ FP16/BF16    │ 8-16 GB GPU (T4 or better)     │  │
+│  │                      │ 0.7B ViT)         │              │ ~6 GB in BF16, mobile capable  │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen2-VL-7B          │ ~8.3B total       │ FP16/BF16    │ 16-24 GB GPU (T4 with int8)    │  │
+│  │                      │                   │ or int8      │ ~16 GB in BF16                 │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen2-VL-72B         │ ~72.7B + 0.7B ViT │ BF16         │ 2×80 GB A100 (multi-GPU)       │  │
+│  │                      │                   │              │ 144 GB in BF16                 │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-2B          │ 2B (dense)        │ BF16/FP8     │ 16 GB GPU                      │  │
+│  │                      │                   │              │ Similar to Qwen2-VL-2B         │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-4B          │ 4B (dense)        │ BF16/FP8     │ 24 GB GPU                      │  │
+│  │                      │                   │              │ New size, fills 2B-7B gap      │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-8B          │ 8B (dense)        │ BF16/FP8     │ 40-48 GB GPU                   │  │
+│  │                      │                   │              │ Single 40GB with FP8           │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-32B         │ 32B (dense)       │ BF16/FP8     │ 1×80 GB H100 (FP8)             │  │
+│  │                      │                   │              │ or 2×40 GB A100                │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-30B-A3B     │ ~30B + 3×experts  │ BF16/FP8     │ 2×80 GB (for full MoE)         │  │
+│  │ (MoE)                │ Only 3B active    │              │ Faster than dense 32B!         │  │
+│  ├──────────────────────┼───────────────────┼──────────────┼────────────────────────────────┤  │
+│  │ Qwen3-VL-235B-A22B   │ 235B + 22 experts │ BF16/FP8     │ 8×80 GB H100 or 8×B200         │  │
+│  │ (MoE)                │ (~657B total)     │              │ FP8 + 8×H100 needed            │  │
+│  │                      │ 22B active        │              │ Ideally Blackwell for 15×      │  │
+│  └──────────────────────┴───────────────────┴──────────────┴────────────────────────────────┘  │
+│                                                                                                 │
+│  NOTES:                                                                                         │
+│  ══════                                                                                         │
+│  • MoE "Param Count" indicates base + expert parameters (only subset active per token)        │
+│  • Blackwell B200 (192 GB) significantly reduces GPUs needed due to larger memory             │
+│  • All Qwen3-VL models support 256K context (expandable to 1M with fine-tuning)               │
+│  • Practical context may be lower on smaller GPUs due to KV cache memory                      │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Latency and Inference Performance
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              INFERENCE PERFORMANCE COMPARISON                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  FACTORS AFFECTING QWEN3-VL PERFORMANCE:                                                        │
+│  ════════════════════════════════════════                                                       │
+│                                                                                                 │
+│    Despite being larger, Qwen3-VL achieves competitive latency due to:                        │
+│                                                                                                 │
+│    1. FP8 SUPPORT (Hopper GPUs)                                                                │
+│       └─ ~2× speedup vs FP16, Qwen2-VL was FP16/BF16 only                                     │
+│                                                                                                 │
+│    2. FLASHATTENTION V2/V3                                                                      │
+│       └─ Faster attention for long sequences                                                  │
+│                                                                                                 │
+│    3. MoE ARCHITECTURE                                                                          │
+│       └─ 235B-A22B doesn't use all parameters per token                                       │
+│       └─ Effective compute lower than a hypothetical dense 130B                               │
+│                                                                                                 │
+│    4. VLLM OPTIMIZATIONS                                                                        │
+│       └─ Chunked prefill: ~30% reduction in time-to-first-token                               │
+│       └─ Prefix caching: Skip recomputation for repeated prompts                              │
+│       └─ Continuous batching: Higher GPU utilization                                          │
+│                                                                                                 │
+│    5. EVS FOR VIDEOS                                                                            │
+│       └─ 75% token reduction → 4× speedup for static scenes                                  │
+│       └─ Qwen2-VL takes linearly longer with more frames                                      │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  COMPARABLE SIZE COMPARISONS:                                                                   │
+│  ════════════════════════════                                                                   │
+│                                                                                                 │
+│    Qwen2-VL-7B vs Qwen3-VL-8B:                                                                 │
+│    • Qwen3-VL-8B slightly more compute, but not dramatically slower                           │
+│    • Better quality per latency dollar                                                         │
+│                                                                                                 │
+│    Qwen2-VL-72B vs Qwen3-VL-32B:                                                               │
+│    • Qwen3-VL-32B is MUCH faster (less than half the parameters)                              │
+│    • May match or surpass 72B performance due to improved training                            │
+│                                                                                                 │
+│    Qwen3-VL-235B on B200 vs Qwen2-VL-72B on A100:                                              │
+│    • Similar latency due to B200's 15× throughput advantage                                   │
+│    • Much better quality from 235B                                                             │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  MULTI-TURN CONVERSATION ADVANTAGE:                                                             │
+│  ══════════════════════════════════                                                             │
+│                                                                                                 │
+│    With PREFIX CACHING in vLLM:                                                                 │
+│                                                                                                 │
+│    Turn 1: [System Prompt + Image] → Full encoding                                            │
+│    Turn 2: [Same context] + [New question] → Reuse cached KV, only encode new question       │
+│    Turn 3: [Same context] + [New question] → Same, even faster                                │
+│                                                                                                 │
+│    Qwen3-VL/vLLM: Reuses image tokens from cache → 2nd query much faster                      │
+│    Qwen2-VL naive: Recomputes vision every time → Consistently slow                           │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### When to Choose Which Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              DECISION GUIDE: QWEN2-VL vs QWEN3-VL                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  CHOOSE QWEN2-VL IF:                                                                            │
+│  ═══════════════════                                                                            │
+│                                                                                                 │
+│    ✓ You have a T4 and want the simplest possible setup                                       │
+│    ✓ You don't process videos (images only)                                                   │
+│    ✓ You need Xformers attention backend (not supported in Qwen3-VL)                          │
+│    ✓ You have existing Qwen2-VL fine-tuned weights you want to reuse                          │
+│    ✓ You need proven production stability (more mature codebase)                              │
+│    ✓ Your use case is well-served by the 2B/7B/72B size options                               │
+│                                                                                                 │
+│  CHOOSE QWEN3-VL IF:                                                                            │
+│  ═══════════════════                                                                            │
+│                                                                                                 │
+│    ✓ You need better fine-grained visual understanding (DeepStack)                            │
+│    ✓ You process videos (EVS dramatically reduces token count)                                │
+│    ✓ You want faster inference with Eagle3 speculative decoding                               │
+│    ✓ You have A100+ and want best quality                                                     │
+│    ✓ You're building GUI agents (MAI-UI is based on Qwen3-VL)                                │
+│    ✓ You need 256K+ context for long documents or videos                                      │
+│    ✓ You want the 4B or 8B size options (not available in Qwen2-VL)                           │
+│    ✓ You need MoE efficiency (30B-A3B or 235B-A22B)                                           │
+│    ✓ You need multilingual OCR beyond 10 languages                                            │
+│    ✓ You need state-of-the-art benchmark performance                                          │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  GPU-BASED DECISION:                                                                            │
+│  ═══════════════════                                                                            │
+│                                                                                                 │
+│    T4 (16 GB):                                                                                  │
+│    • Qwen2-VL-2B (full precision) OR Qwen3-VL-4B (4-bit)                                      │
+│    • Qwen3-VL better if you need video with EVS                                               │
+│                                                                                                 │
+│    A100 (40-80 GB):                                                                             │
+│    • Qwen3-VL-8B (BF16) recommended                                                           │
+│    • Qwen3-VL-30B-A3B MoE if you have 80GB                                                    │
+│                                                                                                 │
+│    H100 (80 GB):                                                                                │
+│    • Qwen3-VL-8B or 32B with FP8                                                              │
+│    • FlashAttention 3 benefits Qwen3-VL more                                                  │
+│                                                                                                 │
+│    B200 (192 GB):                                                                               │
+│    • Qwen3-VL-235B-A22B for maximum quality                                                   │
+│    • 15× throughput advantage makes huge models practical                                     │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Summary: Key Differences at a Glance
 
 ```
@@ -1820,15 +2697,250 @@ if __name__ == "__main__":
 
 ---
 
+## GPU Deployment Best Practices
+
+### Detailed Recommendations by GPU
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              GPU-SPECIFIC DEPLOYMENT GUIDE                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│  NVIDIA T4 (16 GB, Turing SM 7.5)                                                               │
+│  ══════════════════════════════════                                                             │
+│                                                                                                 │
+│    LIMITATIONS:                                                                                 │
+│    • No BF16 support (FP16 only)                                                               │
+│    • No FP8/TensorRT support                                                                   │
+│    • No FlashAttention (uses TORCH_SDPA)                                                       │
+│    • 320 GB/s bandwidth (memory-bound decode)                                                  │
+│                                                                                                 │
+│    RECOMMENDED MODELS:                                                                          │
+│    • Qwen2-VL-2B (FP16): ~4-6 GB, comfortable fit                                              │
+│    • Qwen3-VL-4B (4-bit BitsAndBytes): ~2 GB weights + EVS for videos                         │
+│    • Qwen2-VL-7B (4-bit GPTQ/int8): ~4 GB weights, tight but works                            │
+│                                                                                                 │
+│    CONFIGURATION:                                                                               │
+│    • dtype="half"                                                                               │
+│    • quantization="bitsandbytes" or "gptq"                                                     │
+│    • enforce_eager=True (saves ~0.5 GB)                                                        │
+│    • max_model_len=2048-4096                                                                   │
+│    • max_num_seqs=4                                                                            │
+│    • max_pixels=500000 (~700×700)                                                              │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  NVIDIA A100 (40/80 GB, Ampere SM 8.0)                                                          │
+│  ══════════════════════════════════════                                                         │
+│                                                                                                 │
+│    ADVANTAGES:                                                                                  │
+│    • Native BF16 support (better numerical stability)                                          │
+│    • FlashAttention 2 (2-4× faster attention)                                                  │
+│    • 2,039 GB/s bandwidth (6× faster than T4)                                                  │
+│    • Tensor cores for mixed precision                                                          │
+│                                                                                                 │
+│    RECOMMENDED MODELS:                                                                          │
+│    • Qwen2-VL-7B/72B (BF16): Full precision on 80GB                                           │
+│    • Qwen3-VL-8B (BF16): Excellent fit on 80GB                                                │
+│    • Qwen3-VL-30B-A3B (MoE): Only 3B active per token, fits in 80GB                           │
+│                                                                                                 │
+│    CONFIGURATION:                                                                               │
+│    • dtype="bfloat16"                                                                          │
+│    • enable_prefix_caching=True                                                                │
+│    • max_model_len=16384-32768                                                                 │
+│    • max_num_seqs=16-32                                                                        │
+│    • max_pixels=2073600 (1920×1080)                                                            │
+│                                                                                                 │
+│    FOR QWEN3-VL-235B:                                                                           │
+│    • Requires 8×80 GB A100s                                                                    │
+│    • May need --max-model-len 128000 (not full 256K)                                          │
+│    • Or disable video: --limit-mm-per-prompt.video 0                                          │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  NVIDIA H100 (80 GB, Hopper SM 9.0)                                                             │
+│  ═══════════════════════════════════                                                            │
+│                                                                                                 │
+│    ADVANTAGES:                                                                                  │
+│    • Native FP8 support (2× throughput vs BF16)                                               │
+│    • FP8 KV cache (halves KV cache memory)                                                     │
+│    • FlashAttention 3 (Hopper-specific optimizations)                                          │
+│    • 3,350 GB/s bandwidth (10× faster than T4)                                                 │
+│    • Transformer Engine for automatic mixed precision                                          │
+│                                                                                                 │
+│    RECOMMENDED MODELS:                                                                          │
+│    • Qwen3-VL-8B (FP8): ~8 GB weights, room for 64+ concurrent                                │
+│    • Qwen3-VL-32B (FP8): Fits comfortably with long context                                   │
+│    • Qwen3-VL-235B-A22B (FP8): Full 256K context + video enabled                              │
+│                                                                                                 │
+│    CONFIGURATION:                                                                               │
+│    • quantization="fp8"                                                                        │
+│    • kv_cache_dtype="fp8"                                                                      │
+│    • max_model_len=32768-65536                                                                 │
+│    • max_num_seqs=32-64                                                                        │
+│    • max_pixels=2073600                                                                        │
+│    • enable_prefix_caching=True                                                                │
+│    • enable_chunked_prefill=True                                                               │
+│                                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                 │
+│  NVIDIA B200 (192 GB, Blackwell SM 10.0)                                                        │
+│  ════════════════════════════════════════                                                       │
+│                                                                                                 │
+│    ADVANTAGES:                                                                                  │
+│    • 192 GB HBM3e (12× T4, 2.4× H100)                                                         │
+│    • 8,000 GB/s bandwidth (25× faster than T4)                                                 │
+│    • FP4 support (when available, 4× throughput)                                              │
+│    • 11-15× higher LLM inference throughput vs H100                                           │
+│    • Can run Qwen2-VL-72B on SINGLE GPU                                                        │
+│                                                                                                 │
+│    RECOMMENDED MODELS:                                                                          │
+│    • Qwen2-VL-72B (BF16): Single GPU, no tensor parallelism needed                            │
+│    • Qwen3-VL-235B-A22B: Full MoE model fits with 256K context                                │
+│    • 4K resolution images supported (max_pixels=4,147,200)                                    │
+│                                                                                                 │
+│    CONFIGURATION:                                                                               │
+│    • max_model_len=65536-131072                                                                │
+│    • max_num_seqs=64-128                                                                       │
+│    • max_pixels=4147200 (4K resolution)                                                        │
+│    • enable_prefix_caching=True                                                                │
+│    • enable_chunked_prefill=True                                                               │
+│                                                                                                 │
+│    Run out-of-the-box: Full context length + concurrent image & video processing              │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### vLLM Launch Commands by GPU
+
+```bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# T4 (16 GB) - Qwen3-VL-4B with 4-bit Quantization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+vllm serve Qwen/Qwen3-VL-4B-Instruct \
+    --dtype half \
+    --quantization bitsandbytes \
+    --load-format bitsandbytes \
+    --gpu-memory-utilization 0.92 \
+    --max-model-len 4096 \
+    --enforce-eager \
+    --max-num-seqs 4 \
+    --limit-mm-per-prompt image=2,video=1
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# A100-80GB - Qwen3-VL-8B Full Precision
+# ═══════════════════════════════════════════════════════════════════════════════
+
+vllm serve Qwen/Qwen3-VL-8B-Instruct \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 32768 \
+    --max-num-seqs 32 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --limit-mm-per-prompt image=8,video=2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H100-80GB - Qwen3-VL-8B with FP8 (Maximum Throughput)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+vllm serve Qwen/Qwen3-VL-8B-Instruct \
+    --dtype bfloat16 \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 32768 \
+    --max-num-seqs 64 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --limit-mm-per-prompt image=16,video=4
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8×H100 - Qwen3-VL-235B-A22B MoE (Full Model)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+OMP_NUM_THREADS=1 vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
+    --dtype bfloat16 \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 131072 \
+    --max-num-seqs 32 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# B200-192GB - Qwen3-VL-235B-A22B (Full Features)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
+    --dtype bfloat16 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 262144 \
+    --max-num-seqs 128 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --limit-mm-per-prompt image=32,video=8
+```
+
+---
+
 ## References
 
-- [Qwen2-VL Paper](https://arxiv.org/abs/2409.12191)
-- [Qwen3-VL (2025 successor to Qwen2-VL)]
-- [MAI-UI Paper (arXiv:2512.22047)](https://arxiv.org/abs/2512.22047)
-- [MAI-UI Project Page](https://tongyi-mai.github.io/MAI-UI/)
-- [MAI-UI GitHub](https://github.com/Tongyi-MAI/MAI-UI)
-- [GRPO for GUI Grounding (HuggingFace Blog)](https://huggingface.co/blog/HelloKKMe/grounding-r1)
-- [vLLM Documentation](https://docs.vllm.ai/)
-- [vLLM Vision-Language Models](https://docs.vllm.ai/en/latest/models/vlm.html)
-- [vLLM Qwen3-VL Support](https://github.com/vllm-project/vllm) - `Qwen3VLForConditionalGeneration` in model registry
+### Official Papers and Technical Reports
+
+- **[Qwen2-VL Technical Report](https://arxiv.org/abs/2409.12191)** - "Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution" (arXiv:2409.12191)
+- **[Qwen3-VL Technical Report](https://arxiv.org/abs/2501.18789)** - Comprehensive architectural improvements including DeepStack, EVS, and 256K context
+- **[MAI-UI Paper](https://arxiv.org/abs/2512.22047)** - "MAI-UI: A Foundation GUI Agent Model Family" (arXiv:2512.22047)
+
+### Official GitHub Repositories
+
+- **[Qwen-VL GitHub](https://github.com/QwenLM/Qwen-VL)** - Official Qwen2-VL repository with model weights and examples
+- **[Qwen3-VL GitHub](https://github.com/QwenLM/Qwen3-VL)** - Official Qwen3-VL repository
+- **[MAI-UI GitHub](https://github.com/Tongyi-MAI/MAI-UI)** - GUI agent implementation based on Qwen3-VL
+- **[vLLM GitHub](https://github.com/vllm-project/vllm)** - High-performance inference engine with Qwen-VL support
+
+### Project Pages and Documentation
+
+- **[MAI-UI Project Page](https://tongyi-mai.github.io/MAI-UI/)** - Demos and benchmarks for GUI agents
+- **[vLLM Documentation](https://docs.vllm.ai/)** - Official vLLM documentation
+- **[vLLM Vision-Language Models](https://docs.vllm.ai/en/latest/models/vlm.html)** - VLM-specific configuration
+- **[Qwen Model Cards on Hugging Face](https://huggingface.co/Qwen)** - Model weights and usage instructions
+
+### Blog Posts and Tutorials
+
+- **[GRPO for GUI Grounding](https://huggingface.co/blog/HelloKKMe/grounding-r1)** - Training GUI agents with reinforcement learning
+- **[Qwen2-VL Blog Post](https://qwenlm.github.io/blog/qwen2-vl/)** - Official release announcement
+- **[Efficient Video Sampling (EVS)](https://nvidia.github.io/EVS)** - NVIDIA research on video token pruning
+
+### Hardware References
+
+- **[NVIDIA H100 Datasheet](https://www.nvidia.com/en-us/data-center/h100/)** - FP8, FlashAttention 3 capabilities
+- **[NVIDIA B200 Architecture](https://www.nvidia.com/en-us/data-center/grace-blackwell/)** - Blackwell GPU specifications
+- **[Exxact HPC Blog: Blackwell vs Hopper](https://blog.exxactcorp.com/)** - B200 performance comparisons
+
+### Citation
+
+If you use this guide or the Qwen-VL models in your research, please cite:
+
+```bibtex
+@article{qwen2vl2024,
+  title={Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution},
+  author={Wang, Peng and others},
+  journal={arXiv preprint arXiv:2409.12191},
+  year={2024}
+}
+
+@article{maiui2025,
+  title={MAI-UI: A Foundation GUI Agent Model Family},
+  author={Tongyi Lab},
+  journal={arXiv preprint arXiv:2512.22047},
+  year={2025}
+}
+```
 

@@ -2,7 +2,9 @@
 
 Production-ready code for running Qwen2-VL and Qwen3-VL models on NVIDIA GPUs (T4, A100, H100, B200) with vLLM.
 
-> 📖 **For detailed documentation, see [QWEN_VL_COMPLETE_GUIDE.md](QWEN_VL_COMPLETE_GUIDE.md)**
+> 📖 **For comprehensive documentation, see [QWEN_VL_COMPLETE_GUIDE.md](QWEN_VL_COMPLETE_GUIDE.md)** (~3,000 lines)
+>
+> Covers: Vision-Language Architecture, M-RoPE/Interleaved-MRoPE, DeepStack, EVS, Training Pipelines, GPU Deployment (T4/A100/H100/B200), vLLM Optimization (PagedAttention, Prefix Caching, Chunked Prefill), MAI-UI GUI Agents, GRPO Training, and Comparative Analysis.
 
 ---
 
@@ -52,20 +54,11 @@ python examples/mai_ui_t4/server.py --model-variant 4b-4bit --port 8000
 | File | Description |
 |------|-------------|
 | `QWEN_VL_COMPLETE_GUIDE.md` | **Complete documentation** - Architecture, parameters, optimization |
-| `config.py` | GPU-optimized engine configurations |
-| `gpu_configs.py` | Detailed configs for T4/A100/H100/B200 |
+| `gpu_configs.py` | GPU-optimized engine configurations for T4/A100/H100/B200 |
 | `offline_inference.py` | Batch inference script |
 | `server.py` | OpenAI-compatible API server |
 | `client.py` | GUI agent client library |
-| `colab_notebook.py` | Complete Colab-ready code |
-
-### Notebooks
-
-| Notebook | GPU | Description |
-|----------|-----|-------------|
-| `mai_ui_t4_colab.ipynb` | T4 | Free Colab, 4-bit quantization |
-| `h100_colab.ipynb` | H100 | High throughput, FP8 |
-| `b200_colab.ipynb` | B200 | Maximum context, 4K images |
+| `mai_ui_t4_colab.ipynb` | Google Colab notebook (T4 optimized) |
 
 ---
 
