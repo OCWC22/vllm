@@ -610,6 +610,319 @@ Understanding how CUDA Streaming Multiprocessors (SMs) execute Qwen3-VL inferenc
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### A100 SM Layout: Qwen3-VL-8B Execution
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    A100-80GB: 108 SMs × QWEN3-VL-8B EXECUTION MAP                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   A100 SINGLE SM INTERNAL LAYOUT (SM 8.0 Ampere):                                                       │
+│   ═══════════════════════════════════════════════                                                       │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │                           STREAMING MULTIPROCESSOR (1 of 108)                                     ││
+│   │  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐ ││
+│   │  │ PROCESSING BLOCKS (4 per SM)                                                                │ ││
+│   │  │ ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐ │ ││
+│   │  │ │ Warp Scheduler 0   │ │ Warp Scheduler 1   │ │ Warp Scheduler 2   │ │ Warp Scheduler 3   │ │ ││
+│   │  │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ││
+│   │  │ │ │ 16 FP32 Cores  │ │ │ │ 16 FP32 Cores  │ │ │ │ 16 FP32 Cores  │ │ │ │ 16 FP32 Cores  │ │ │ ││
+│   │  │ │ │ 8 FP64 Cores   │ │ │ │ 8 FP64 Cores   │ │ │ │ 8 FP64 Cores   │ │ │ │ 8 FP64 Cores   │ │ │ ││
+│   │  │ │ │ 16 INT32 Cores │ │ │ │ 16 INT32 Cores │ │ │ │ 16 INT32 Cores │ │ │ │ 16 INT32 Cores │ │ │ ││
+│   │  │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ ││
+│   │  │ │ │ (3rd Gen)      │ │ │ │ (3rd Gen)      │ │ │ │ (3rd Gen)      │ │ │ │ (3rd Gen)      │ │ │ ││
+│   │  │ │ └────────────────┘ │ │ └────────────────┘ │ │ └────────────────┘ │ │ └────────────────┘ │ │ ││
+│   │  │ │ Register File:    │ │ Register File:     │ │ Register File:     │ │ Register File:     │ │ ││
+│   │  │ │ 64KB (16K×32bit)  │ │ 64KB (16K×32bit)   │ │ 64KB (16K×32bit)   │ │ 64KB (16K×32bit)   │ │ ││
+│   │  │ └────────────────────┘ └────────────────────┘ └────────────────────┘ └────────────────────┘ │ ││
+│   │  └─────────────────────────────────────────────────────────────────────────────────────────────┘ ││
+│   │  ┌──────────────────────────────────────┐  ┌───────────────────────────────────────────────────┐ ││
+│   │  │ SHARED MEMORY / L1 CACHE             │  │ SPECIAL FUNCTION UNITS                            │ ││
+│   │  │ 192 KB configurable                  │  │ 4 SFU (sin, cos, exp, log)                        │ ││
+│   │  │ • 164 KB shared + 28 KB L1           │  │ 4 Load/Store Units (32 threads each)              │ ││
+│   │  │ • FlashAttn uses 128KB tiles        │  │ 32 LD/ST per cycle                                │ ││
+│   │  └──────────────────────────────────────┘  └───────────────────────────────────────────────────┘ ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   QWEN3-VL-8B LAYER EXECUTION ON A100:                                                                  │
+│   ════════════════════════════════════                                                                  │
+│   Model: 32 LLM layers, 32 attention heads, 8 KV heads (GQA 4:1), hidden=4096                          │
+│                                                                                                         │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ ATTENTION FORWARD PASS (FlashAttention 2):                                                        ││
+│   │                                                                                                   ││
+│   │ Grid: (num_heads=32, batch_size=16, kv_splits=1) = 512 thread blocks                             ││
+│   │ Block: 128 threads (4 warps × 32 threads)                                                         ││
+│   │ Total threads: 512 × 128 = 65,536 threads                                                         ││
+│   │                                                                                                   ││
+│   │ SM Occupancy: 512 blocks ÷ 108 SMs = ~4.7 blocks/SM                                              ││
+│   │ Active warps/SM: 4.7 × 4 = ~19 warps (of 64 max) = 30% occupancy                                 ││
+│   │                                                                                                   ││
+│   │ Per-Block Memory:                                                                                 ││
+│   │ • Q tile: 64 tokens × 128 dim × 2 bytes = 16 KB                                                  ││
+│   │ • K tile: 256 tokens × 128 dim × 2 bytes = 64 KB                                                 ││
+│   │ • V tile: 256 tokens × 128 dim × 2 bytes = 64 KB                                                 ││
+│   │ • Softmax accumulators: 8 KB                                                                      ││
+│   │ Total shared memory: 152 KB (fits in 164 KB!)                                                     ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ MLP FORWARD PASS (gate_up_proj + down_proj):                                                      ││
+│   │                                                                                                   ││
+│   │ gate_up: [batch×seq, 4096] × [4096, 24576] → [batch×seq, 24576]                                  ││
+│   │ Grid: (ceil(M/128), ceil(N/128)) where M=batch×seq, N=24576                                       ││
+│   │                                                                                                   ││
+│   │ Tensor Core utilization:                                                                          ││
+│   │ • Each Tensor Core: 256 FP16 ops/cycle (16×16×16 matrix)                                         ││
+│   │ • 108 SMs × 4 Tensor Cores = 432 Tensor Cores                                                    ││
+│   │ • Peak: 432 × 256 × 1.41 GHz = 156 TFLOPS (FP16)                                                ││
+│   │ • Achieved: ~80% = 125 TFLOPS (memory bound on large batches)                                    ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   KV CACHE MEMORY LAYOUT (PagedAttention):                                                              │
+│   ════════════════════════════════════════                                                              │
+│   Block size: 16 tokens (vLLM default for FlashAttn)                                                   │
+│   Per block: 2 × 32 layers × 8 kv_heads × 128 dim × 16 tokens × 2 bytes = 2 MB                        │
+│                                                                                                         │
+│   80 GB HBM allocation:                                                                                 │
+│   ├─ Model weights (BF16): 8B × 2 bytes = 16 GB                                                        │
+│   ├─ Vision encoder: 500M × 2 bytes = 1 GB                                                             │
+│   ├─ Activations: ~4 GB                                                                                │
+│   ├─ CUDA overhead: ~2 GB                                                                              │
+│   └─ KV Cache: 80 - 23 = 57 GB available                                                               │
+│       └─ 57 GB ÷ 2 MB/block = 28,500 blocks                                                            │
+│       └─ 28,500 blocks × 16 tokens = 456,000 tokens of KV cache                                        │
+│       └─ At 32K context: 456K ÷ 32K = 14 concurrent sequences                                          │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### H100 SM Layout: Qwen3-VL-8B with FP8
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    H100-80GB: 132 SMs × QWEN3-VL-8B (FP8) EXECUTION MAP                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   H100 SINGLE SM INTERNAL LAYOUT (SM 9.0 Hopper):                                                       │
+│   ═══════════════════════════════════════════════                                                       │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │                           STREAMING MULTIPROCESSOR (1 of 132)                                     ││
+│   │  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐ ││
+│   │  │ PROCESSING BLOCKS (4 per SM) - ENHANCED FOR HOPPER                                          │ ││
+│   │  │ ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐ │ ││
+│   │  │ │ Warp Scheduler 0   │ │ Warp Scheduler 1   │ │ Warp Scheduler 2   │ │ Warp Scheduler 3   │ │ ││
+│   │  │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ┌────────────────┐ │ │ ││
+│   │  │ │ │ 32 FP32 Cores  │ │ │ │ 32 FP32 Cores  │ │ │ │ 32 FP32 Cores  │ │ │ │ 32 FP32 Cores  │ │ │ ││
+│   │  │ │ │ 16 FP64 Cores  │ │ │ │ 16 FP64 Cores  │ │ │ │ 16 FP64 Cores  │ │ │ │ 16 FP64 Cores  │ │ │ ││
+│   │  │ │ │ 32 INT32 Cores │ │ │ │ 32 INT32 Cores │ │ │ │ 32 INT32 Cores │ │ │ │ 32 INT32 Cores │ │ │ ││
+│   │  │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ │ 1 Tensor Core  │ │ │ ││
+│   │  │ │ │ (4th Gen+FP8)  │ │ │ │ (4th Gen+FP8)  │ │ │ │ (4th Gen+FP8)  │ │ │ │ (4th Gen+FP8)  │ │ │ ││
+│   │  │ │ └────────────────┘ │ │ └────────────────┘ │ │ └────────────────┘ │ │ └────────────────┘ │ │ ││
+│   │  │ │ Register: 64KB    │ │ Register: 64KB     │ │ Register: 64KB     │ │ Register: 64KB     │ │ ││
+│   │  │ └────────────────────┘ └────────────────────┘ └────────────────────┘ └────────────────────┘ │ ││
+│   │  └─────────────────────────────────────────────────────────────────────────────────────────────┘ ││
+│   │  ┌──────────────────────────────────────┐  ┌───────────────────────────────────────────────────┐ ││
+│   │  │ SHARED MEMORY / L1 CACHE             │  │ NEW IN HOPPER                                     │ ││
+│   │  │ 256 KB configurable                  │  │ • Tensor Memory Accelerator (TMA)                │ ││
+│   │  │ • 228 KB shared + 28 KB L1           │  │   - Async copy global→shared                     │ ││
+│   │  │ • FlashAttn3 uses 192KB tiles       │  │   - Bypasses L1 for KV loads                     │ ││
+│   │  │ • 50% larger tiles than A100!       │  │ • Thread Block Clusters                          │ ││
+│   │  └──────────────────────────────────────┘  │   - 16 SMs can share data                        │ ││
+│   │                                             └───────────────────────────────────────────────────┘ ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   QWEN3-VL-8B FP8 EXECUTION DIFFERENCES:                                                                │
+│   ═══════════════════════════════════════                                                               │
+│                                                                                                         │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ FP8 TENSOR CORE OPERATIONS:                                                                       ││
+│   │                                                                                                   ││
+│   │ Precision: E4M3 (weights) × E5M2 (activations) → FP32 accumulate → BF16 output                   ││
+│   │                                                                                                   ││
+│   │ Per Tensor Core (4th Gen):                                                                        ││
+│   │ • FP8: 512 ops/cycle (2× FP16)                                                                   ││
+│   │ • Matrix shape: 16×16×32 (vs 16×16×16 for FP16)                                                  ││
+│   │                                                                                                   ││
+│   │ H100 Peak FP8:                                                                                    ││
+│   │ • 132 SMs × 4 Tensor Cores × 512 ops × 1.98 GHz = 1,979 TFLOPS                                  ││
+│   │ • vs A100 FP16: 312 TFLOPS (6.3× faster!)                                                        ││
+│   │                                                                                                   ││
+│   │ FlashAttention 3 Optimizations (vllm/v1/attention/backends/flash_attn.py):                       ││
+│   │ • Warp specialization: Producer warps load K,V; Consumer warps compute                          ││
+│   │ • Async TMA: K,V loaded while previous tile computes                                             ││
+│   │ • FP8 KV cache: kv_cache_dtype="fp8" halves memory                                               ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ H100 KV CACHE MEMORY LAYOUT (FP8):                                                                ││
+│   │                                                                                                   ││
+│   │ Block size: 16 tokens                                                                             ││
+│   │ Per block (FP8): 2 × 32 layers × 8 kv_heads × 128 dim × 16 tokens × 1 byte = 1 MB               ││
+│   │ (50% of A100 BF16!)                                                                               ││
+│   │                                                                                                   ││
+│   │ 80 GB HBM allocation (FP8 weights + FP8 KV):                                                      ││
+│   │ ├─ Model weights (FP8): 8B × 1 byte = 8 GB                                                        ││
+│   │ ├─ Vision encoder (FP16): 500M × 2 bytes = 1 GB                                                   ││
+│   │ ├─ Activations: ~4 GB                                                                             ││
+│   │ ├─ CUDA overhead: ~2 GB                                                                           ││
+│   │ └─ KV Cache: 80 - 15 = 65 GB available                                                            ││
+│   │     └─ 65 GB ÷ 1 MB/block = 65,000 blocks                                                         ││
+│   │     └─ 65,000 × 16 tokens = 1,040,000 tokens                                                      ││
+│   │     └─ At 32K context: 1.04M ÷ 32K = 32 concurrent sequences                                     ││
+│   │     └─ 2× more than A100!                                                                         ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B200 SM Layout: Qwen3-VL-32B and MoE Models
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    B200-192GB: 192 SMs × QWEN3-VL-32B EXECUTION MAP                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   B200 SINGLE SM LAYOUT (SM 10.0 Blackwell):                                                            │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ STREAMING MULTIPROCESSOR (1 of 192)                                                               ││
+│   │ ┌─────────────────────────────────────────────────────────────────────────────────────────────┐  ││
+│   │ │ 4× Warp Schedulers, each with:                                                              │  ││
+│   │ │ • 32 FP32 CUDA Cores (128 total/SM)                                                        │  ││
+│   │ │ • 16 FP64 CUDA Cores (64 total/SM)                                                         │  ││
+│   │ │ • 1 Tensor Core 5th Gen (4 total/SM) - FP4/FP8/BF16/TF32                                   │  ││
+│   │ │ • 64KB Register File per scheduler (256KB total/SM)                                        │  ││
+│   │ └─────────────────────────────────────────────────────────────────────────────────────────────┘  ││
+│   │ ┌─────────────────────────────────────────────────────────────────────────────────────────────┐  ││
+│   │ │ Shared Memory: ~300KB configurable (256KB usable for tiles)                                │  ││
+│   │ │ L2 Cache: 64MB shared across all 192 SMs                                                   │  ││
+│   │ │ HBM3e: 192GB @ 8,000 GB/s (8 stacks × 24GB)                                               │  ││
+│   │ └─────────────────────────────────────────────────────────────────────────────────────────────┘  ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│   QWEN3-VL-32B EXECUTION (64 layers, 40 heads, 8 KV heads):                                            │
+│   ═══════════════════════════════════════════════════════════                                          │
+│   • Grid: (40 heads × 64 batch × 2 splits) = 5,120 blocks                                              │
+│   • Blocks/SM: 5,120 ÷ 192 = 27 blocks (high occupancy)                                               │
+│   • Weights (BF16): 32B × 2 = 64 GB                                                                    │
+│   • KV Cache: 192 - 64 - 8 = 120 GB → 30,000 blocks → 480K tokens                                    │
+│   • Throughput: ~250 tokens/sec                                                                        │
+│                                                                                                         │
+│   QWEN3-VL-235B-A22B MoE (128 experts, 8 active):                                                      │
+│   ══════════════════════════════════════════════                                                       │
+│   • All experts: 235B × 2 = 470 GB (needs 3× B200)                                                     │
+│   • Per-GPU with TP=3: 157 GB, ~43 experts each                                                        │
+│   • NVLink 5.0: 1.8 TB/s for All-to-All routing                                                        │
+│   • Active compute: 22B params at FP8 → 800 TFLOPS effective                                          │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Model × GPU Execution Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│              QWEN3-VL MODEL × GPU SM EXECUTION MATRIX                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│  ┌───────────────┬────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ MODEL         │ T4 (40 SMs)        A100 (108 SMs)      H100 (132 SMs)       B200 (192 SMs)        ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-2B   │ ✅ FlashInfer     ✅ FlashAttn2      ✅ FlashAttn3       ✅ FlashAttn3          ││
+│  │ 28L/16H/4KV   │ 64 blocks         64 blocks          64 blocks           64 blocks              ││
+│  │               │ 1.6 blk/SM        0.6 blk/SM         0.5 blk/SM          0.3 blk/SM             ││
+│  │               │ 20 tok/s          80 tok/s           150 tok/s           280 tok/s              ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-4B   │ ✅ FlashInfer+4b  ✅ FlashAttn2      ✅ FlashAttn3       ✅ FlashAttn3          ││
+│  │ 36L/24H/4KV   │ 96 blocks         96 blocks          96 blocks           96 blocks              ││
+│  │               │ 2.4 blk/SM        0.9 blk/SM         0.7 blk/SM          0.5 blk/SM             ││
+│  │               │ 18 tok/s          100 tok/s          180 tok/s           300 tok/s              ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-8B   │ ⚠️ 4-bit only     ✅ FlashAttn2      ✅ FlashAttn3+FP8   ✅ FlashAttn3          ││
+│  │ 32L/32H/8KV   │ 512 blocks        512 blocks         512 blocks          512 blocks             ││
+│  │               │ 12.8 blk/SM       4.7 blk/SM         3.9 blk/SM          2.7 blk/SM             ││
+│  │               │ 10 tok/s          100 tok/s          200 tok/s           350 tok/s              ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-32B  │ ❌ OOM            ⚠️ FP8 tight       ✅ FlashAttn3+FP8   ✅ FlashAttn3          ││
+│  │ 64L/40H/8KV   │ -                 2,560 blocks       2,560 blocks        5,120 blocks           ││
+│  │               │ -                 23.7 blk/SM        19.4 blk/SM         26.7 blk/SM            ││
+│  │               │ -                 40 tok/s           80 tok/s            250 tok/s              ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-30B  │ ❌ OOM            ✅ MoE on 80GB     ✅ MoE+FP8          ✅ MoE native          ││
+│  │ -A3B (MoE)    │ -                 All 128 experts    All experts         All experts            ││
+│  │ 128 experts   │ -                 3B active/tok      3B active/tok       3B active/tok          ││
+│  │               │ -                 60 tok/s           120 tok/s           200 tok/s              ││
+│  ├───────────────┼────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ Qwen3-VL-235B │ ❌ OOM            ❌ 8×A100 needed   ✅ 8×H100 TP=8      ✅ 3×B200 TP=3         ││
+│  │ -A22B (MoE)   │ -                 ~50 tok/s          ~80 tok/s           ~120 tok/s             ││
+│  └───────────────┴────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                         │
+│  LEGEND:                                                                                                │
+│  • blk/SM = Thread blocks per SM (higher = better occupancy, up to ~32 max)                           │
+│  • tok/s = Approximate decode throughput (single sequence, 256 output tokens)                         │
+│  • TP = Tensor Parallelism across GPUs                                                                 │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### vLLM Source Code → SM Mapping
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│              VLLM CODE REFERENCES → GPU EXECUTION                                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│  vllm/platforms/cuda.py - GPU Detection:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ def get_device_capability(cls, device_id=0) -> DeviceCapability:                               │  │
+│  │     major, minor = torch.cuda.get_device_capability(device_id)                                  │  │
+│  │     return DeviceCapability(major=major, minor=minor)                                           │  │
+│  │                                                                                                 │  │
+│  │ # T4:   (7, 5) = SM 7.5 Turing   → 40 SMs,  64KB shared,  no FlashAttn                        │  │
+│  │ # A100: (8, 0) = SM 8.0 Ampere   → 108 SMs, 164KB shared, FlashAttn 2                         │  │
+│  │ # H100: (9, 0) = SM 9.0 Hopper   → 132 SMs, 228KB shared, FlashAttn 3 + FP8                   │  │
+│  │ # B200: (10,0) = SM 10.0 Blackwell → 192 SMs, 256KB shared, FlashAttn 3 + FP4                 │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+│  vllm/v1/attention/backends/flash_attn.py - Backend Selection:                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ class FlashAttentionBackend:                                                                    │  │
+│  │     def supports_compute_capability(cls, cap: DeviceCapability) -> bool:                       │  │
+│  │         return cap >= DeviceCapability(8, 0)  # A100+ only                                     │  │
+│  │                                                                                                 │  │
+│  │ # CUDA kernel grid for attention:                                                               │  │
+│  │ # grid = (num_heads, batch_size, ceil(seq_len / BLOCK_M))                                      │  │
+│  │ # Example: 32 heads × 16 batch × 32 splits = 16,384 thread blocks                             │  │
+│  │ # A100: 16,384 ÷ 108 SMs = 152 waves                                                          │  │
+│  │ # H100: 16,384 ÷ 132 SMs = 124 waves (22% faster)                                             │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+│  vllm/v1/attention/backends/flashinfer.py - T4 Fallback:                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ class FlashInferBackend:                                                                        │  │
+│  │     def supports_compute_capability(cls, cap: DeviceCapability) -> bool:                       │  │
+│  │         return cap >= DeviceCapability(7, 5) and cap <= DeviceCapability(12, 1)                │  │
+│  │                                                                                                 │  │
+│  │ # T4 compatible! Uses smaller 64×64 tiles (vs 128×128)                                         │  │
+│  │ # Shared memory: 64KB limit → 48KB tiles max                                                   │  │
+│  │ # Block sizes: [64, 128, 256] tokens                                                           │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+│  vllm/v1/attention/backends/mla/flashmla.py - Hopper/Blackwell Only:                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ class FlashMLABackend:                                                                          │  │
+│  │     def supports_compute_capability(cls, cap: DeviceCapability) -> bool:                       │  │
+│  │         return cap.major in [9, 10]  # H100 and B200 ONLY                                      │  │
+│  │                                                                                                 │  │
+│  │ # Uses Hopper/Blackwell specific features:                                                      │  │
+│  │ # - Tensor Memory Accelerator (TMA) for async K,V loads                                        │  │
+│  │ # - Warp specialization: producer warps load, consumer warps compute                           │  │
+│  │ # - Thread block clusters: share data across 16 SMs                                            │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## Complete Architecture Diagrams

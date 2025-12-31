@@ -1109,6 +1109,153 @@ Understanding GPU hardware is critical for optimizing vLLM inference. Based on [
 ╚═════════════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
+### Detailed SM Layout per GPU
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    A100: 108 SMs - DETAILED INTERNAL ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   SINGLE SM (Ampere SM 8.0):                                                                    │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ 4× Processing Blocks, each containing:                                                    ││
+│   │ ├─ Warp Scheduler (issue 1 instruction/cycle to 32 threads)                              ││
+│   │ ├─ 16 FP32 CUDA Cores (64 total/SM)                                                      ││
+│   │ ├─ 8 FP64 Cores (32 total/SM)                                                            ││
+│   │ ├─ 16 INT32 Cores (64 total/SM)                                                          ││
+│   │ ├─ 1 Tensor Core 3rd Gen (4 total/SM) - FP16/BF16/TF32                                   ││
+│   │ └─ 64KB Register File (256KB total/SM)                                                   ││
+│   │                                                                                           ││
+│   │ Shared Resources:                                                                         ││
+│   │ ├─ 192KB Shared Memory / L1 Cache (configurable, 164KB for shared typical)               ││
+│   │ ├─ 4 Load/Store Units (128 bytes/cycle)                                                  ││
+│   │ └─ 4 Special Function Units (SFU: sin, cos, exp, rsqrt)                                  ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+│   QWEN3-VL-8B ON A100 (FlashAttention 2):                                                       │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ Attention grid: (32 heads × 16 batch × 1 split) = 512 thread blocks                      ││
+│   │ Blocks per SM: 512 ÷ 108 = 4.7 blocks/SM                                                 ││
+│   │                                                                                           ││
+│   │ Per-block shared memory allocation:                                                       ││
+│   │ ├─ Q tile: 64 tokens × 128 dim × 2 bytes (BF16) = 16 KB                                  ││
+│   │ ├─ K tile: 256 tokens × 128 dim × 2 bytes = 64 KB                                        ││
+│   │ ├─ V tile: 256 tokens × 128 dim × 2 bytes = 64 KB                                        ││
+│   │ └─ Softmax accumulators: 8 KB                                                            ││
+│   │ Total: 152 KB (fits in 164KB shared memory!)                                              ││
+│   │                                                                                           ││
+│   │ Tensor Core utilization:                                                                  ││
+│   │ ├─ Each TC: 256 FP16 ops/cycle (m16n16k16)                                               ││
+│   │ ├─ 108 SMs × 4 TCs × 256 ops × 1.41 GHz = 156 TFLOPS peak                               ││
+│   │ └─ Achieved: ~125 TFLOPS (80% utilization, memory bound)                                 ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    H100: 132 SMs - DETAILED INTERNAL ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   SINGLE SM (Hopper SM 9.0):                                                                    │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ 4× Processing Blocks, each containing:                                                    ││
+│   │ ├─ Warp Scheduler (issue 1 instruction/cycle)                                            ││
+│   │ ├─ 32 FP32 CUDA Cores (128 total/SM) [2× A100!]                                          ││
+│   │ ├─ 16 FP64 Cores (64 total/SM)                                                           ││
+│   │ ├─ 32 INT32 Cores (128 total/SM)                                                         ││
+│   │ ├─ 1 Tensor Core 4th Gen (4 total/SM) - FP16/BF16/TF32/FP8!                              ││
+│   │ └─ 64KB Register File (256KB total/SM)                                                   ││
+│   │                                                                                           ││
+│   │ NEW in Hopper:                                                                            ││
+│   │ ├─ 256KB Shared Memory / L1 (228KB usable, 1.4× A100)                                    ││
+│   │ ├─ Tensor Memory Accelerator (TMA) - async global→shared copy                           ││
+│   │ ├─ Thread Block Clusters - share memory across 16 SMs                                    ││
+│   │ └─ FP8 Tensor Cores: 512 ops/cycle (2× FP16)                                             ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+│   QWEN3-VL-8B ON H100 WITH FP8 (FlashAttention 3):                                              │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ FlashAttention 3 optimizations:                                                           ││
+│   │ ├─ Warp specialization: 2 warps load K,V via TMA, 2 warps compute                        ││
+│   │ ├─ Async pipeline: K,V for tile N+1 loads while tile N computes                         ││
+│   │ └─ Larger tiles: 192KB shared allows 384-token K,V tiles                                 ││
+│   │                                                                                           ││
+│   │ FP8 execution:                                                                            ││
+│   │ ├─ Weights: E4M3 (8B × 1 byte = 8 GB, vs 16 GB BF16)                                     ││
+│   │ ├─ KV cache: E5M2 (1 byte/element, 2× more tokens fit)                                   ││
+│   │ ├─ Tensor Core ops: 512 FP8 ops/cycle (vs 256 FP16)                                      ││
+│   │ └─ Peak: 132 SMs × 4 TCs × 512 ops × 1.98 GHz = 1,979 TFLOPS                            ││
+│   │                                                                                           ││
+│   │ KV Cache capacity with FP8:                                                               ││
+│   │ ├─ Block size: 2 × 32 layers × 8 heads × 128 dim × 16 tok × 1 byte = 1 MB               ││
+│   │ ├─ Available: 80 GB - 8 GB (model) - 5 GB (vision+overhead) = 67 GB                     ││
+│   │ ├─ Blocks: 67,000 blocks → 1,072,000 tokens                                             ││
+│   │ └─ At 32K context: 33 concurrent sequences (vs 14 on A100)                              ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    B200: 192 SMs - DETAILED INTERNAL ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   SINGLE SM (Blackwell SM 10.0):                                                                │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ 4× Processing Blocks (similar to Hopper, enhanced):                                       ││
+│   │ ├─ 32 FP32 CUDA Cores per block (128 total/SM)                                           ││
+│   │ ├─ 16 FP64 Cores per block (64 total/SM)                                                 ││
+│   │ ├─ 1 Tensor Core 5th Gen per block (4 total/SM) - FP16/BF16/TF32/FP8/FP4!               ││
+│   │ └─ 64KB Register File per block (256KB total/SM)                                         ││
+│   │                                                                                           ││
+│   │ NEW in Blackwell:                                                                         ││
+│   │ ├─ ~300KB Shared Memory / L1 (~256KB usable)                                             ││
+│   │ ├─ 2nd Gen Transformer Engine (dynamic FP8/FP4 selection)                                ││
+│   │ ├─ Enhanced TMA (higher bandwidth async copies)                                          ││
+│   │ ├─ FP4 Tensor Cores: 1024 ops/cycle (4× FP16!)                                           ││
+│   │ └─ 8 TB/s HBM3e bandwidth (2.4× H100)                                                    ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+│   QWEN3-VL-32B ON B200 (FlashAttention 3):                                                      │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ Model specs: 64 layers, 40 heads, 8 KV heads, hidden=5120                                 ││
+│   │                                                                                           ││
+│   │ Attention execution:                                                                      ││
+│   │ ├─ Grid: (40 heads × 64 batch × 2 splits) = 5,120 blocks                                 ││
+│   │ ├─ Blocks/SM: 5,120 ÷ 192 = 27 blocks/SM (excellent occupancy)                          ││
+│   │ ├─ Tile sizes: 512-token K,V tiles (256KB shared allows this)                           ││
+│   │ └─ Throughput: ~250 tokens/sec                                                           ││
+│   │                                                                                           ││
+│   │ Memory layout:                                                                            ││
+│   │ ├─ Weights (BF16): 32B × 2 bytes = 64 GB                                                 ││
+│   │ ├─ Vision encoder: ~4 GB                                                                 ││
+│   │ ├─ Overhead: ~4 GB                                                                       ││
+│   │ ├─ KV Cache: 192 - 72 = 120 GB available                                                 ││
+│   │ │   └─ Block size: 2 × 64 × 8 × 128 × 16 × 2 = 4 MB                                     ││
+│   │ │   └─ Blocks: 30,000 → 480,000 tokens                                                   ││
+│   │ └─ At 64K context: 7 concurrent sequences                                                ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+│   QWEN3-VL-235B-A22B MoE ON 3×B200 (Tensor Parallel):                                           │
+│   ┌───────────────────────────────────────────────────────────────────────────────────────────┐│
+│   │ Expert distribution:                                                                      ││
+│   │ ├─ Total: 235B params, 128 experts                                                       ││
+│   │ ├─ Per GPU: ~43 experts, ~157 GB                                                         ││
+│   │ ├─ Active per token: 8 experts (22B params)                                              ││
+│   │ └─ NVLink 5.0: 1.8 TB/s for All-to-All routing                                           ││
+│   │                                                                                           ││
+│   │ Execution flow per token:                                                                 ││
+│   │ 1. Router MLP: classify token → top-8 experts                                            ││
+│   │ 2. All-to-All dispatch: send tokens to owning GPUs                                       ││
+│   │ 3. Expert compute: 8 experts × (gate_up + down) MLPs                                     ││
+│   │ 4. All-to-All gather: return results to original positions                               ││
+│   │ 5. Weighted sum: combine 8 expert outputs                                                ││
+│   │                                                                                           ││
+│   │ Throughput: ~100-120 tokens/sec                                                           ││
+│   └───────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Model Fit by GPU
 
 ```
