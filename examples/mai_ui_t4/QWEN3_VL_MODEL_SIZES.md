@@ -2,6 +2,23 @@
 
 All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU deployment configurations.
 
+**Companion Guide**: See [QWEN_VL_COMPLETE_GUIDE.md](./QWEN_VL_COMPLETE_GUIDE.md) for detailed architectural explanations, training pipelines, and MAI-UI integration.
+
+---
+
+## Table of Contents
+
+1. [Quick Reference: Model Selection by GPU](#quick-reference-model-selection-by-gpu)
+2. [All Qwen3-VL Models: Architecture Breakdown](#all-qwen3-vl-models-architecture-breakdown)
+3. [Qwen3 vs Qwen3-VL: Text-Only vs Multimodal](#qwen3-vs-qwen3-vl-text-only-vs-multimodal)
+4. [Complete Architecture Diagrams](#complete-architecture-diagrams)
+5. [vLLM PagedAttention for Multimodal](#vllm-pagedattention-for-multimodal)
+6. [GPU Memory Layout Diagrams](#gpu-memory-layout-diagrams)
+7. [vLLM Deployment Configurations](#vllm-deployment-configurations)
+8. [Performance Benchmarks](#performance-benchmarks)
+9. [Summary: Model Selection Guide](#summary-model-selection-guide)
+10. [References](#references)
+
 ---
 
 ## Quick Reference: Model Selection by GPU
@@ -42,6 +59,113 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
 │  8×B200       1.5 TB    Qwen3-VL-235B-A22B      BF16        256K          128          ~200ms             │
 │                                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Qwen3 vs Qwen3-VL: Text-Only vs Multimodal
+
+Understanding the fundamental difference between the Qwen3 LLM series (text-only) and Qwen3-VL (vision-language):
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                              QWEN3 (TEXT-ONLY) vs QWEN3-VL (MULTIMODAL)                                   ║
+╠═══════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                           ║
+║   QWEN3 (Text-Only LLM)                           QWEN3-VL (Vision-Language Model)                       ║
+║   ═════════════════════                           ════════════════════════════════                       ║
+║                                                                                                           ║
+║   ┌─────────────────────────────────┐             ┌─────────────────────────────────────────────────────┐║
+║   │                                 │             │                                                     │║
+║   │     Text Input                  │             │     Image/Video Input         Text Input           │║
+║   │         │                       │             │           │                       │                 │║
+║   │         ▼                       │             │           ▼                       │                 │║
+║   │   ┌───────────┐                 │             │   ┌───────────────────┐          │                 │║
+║   │   │ Tokenizer │                 │             │   │  Vision Encoder   │          │                 │║
+║   │   │ + Embed   │                 │             │   │  (ViT + DeepStack)│          │                 │║
+║   │   └─────┬─────┘                 │             │   └─────────┬─────────┘          │                 │║
+║   │         │                       │             │             │                     │                 │║
+║   │         ▼                       │             │             ▼                     ▼                 │║
+║   │   ┌───────────┐                 │             │   ┌─────────────────────────────────────┐          │║
+║   │   │  Qwen3    │                 │             │   │  [Visual Tokens] + [Text Tokens]   │          │║
+║   │   │  LLM      │                 │             │   │         Merged Sequence             │          │║
+║   │   │  Decoder  │                 │             │   └─────────────────┬───────────────────┘          │║
+║   │   └─────┬─────┘                 │             │                     │                               │║
+║   │         │                       │             │                     ▼                               │║
+║   │         ▼                       │             │   ┌─────────────────────────────────────┐          │║
+║   │    Text Output                  │             │   │  Qwen3 LLM Decoder                  │          │║
+║   │                                 │             │   │  (with DeepStack injection at       │          │║
+║   │                                 │             │   │   early layers)                     │          │║
+║   └─────────────────────────────────┘             │   └─────────────────┬───────────────────┘          │║
+║                                                   │                     │                               │║
+║                                                   │                     ▼                               │║
+║                                                   │              Text Output                             │║
+║                                                   │   (can describe images, answer visual Q&A)          │║
+║                                                   └─────────────────────────────────────────────────────┘║
+║                                                                                                           ║
+║   MODEL SIZE COMPARISON:                                                                                  ║
+║   ══════════════════════                                                                                  ║
+║                                                                                                           ║
+║   ┌────────────────────────────┬───────────────────────────┬─────────────────────────────────────────┐   ║
+║   │ Qwen3 (Text)               │ Qwen3-VL (Multimodal)     │ Difference                              │   ║
+║   ├────────────────────────────┼───────────────────────────┼─────────────────────────────────────────┤   ║
+║   │ Qwen3-0.6B                 │ (no VL variant)           │ Too small for vision encoder overhead   │   ║
+║   │ Qwen3-1.7B                 │ (no VL variant)           │ Too small for vision encoder overhead   │   ║
+║   │ Qwen3-4B                   │ Qwen3-VL-4B (~4.5B)       │ +500M for ViT encoder                   │   ║
+║   │ Qwen3-8B                   │ Qwen3-VL-8B (~8.5B)       │ +500M for ViT encoder                   │   ║
+║   │ Qwen3-14B                  │ (no VL variant yet)       │ Gap in lineup                           │   ║
+║   │ Qwen3-32B                  │ Qwen3-VL-32B (~33B)       │ +1B for larger ViT encoder              │   ║
+║   │ Qwen3-30B-A3B (MoE)        │ Qwen3-VL-30B-A3B (~31B)   │ +1B for ViT encoder                     │   ║
+║   │ Qwen3-235B-A22B (MoE)      │ Qwen3-VL-235B-A22B (~237B)│ +2B for largest ViT encoder             │   ║
+║   └────────────────────────────┴───────────────────────────┴─────────────────────────────────────────┘   ║
+║                                                                                                           ║
+║   KEY ARCHITECTURAL DIFFERENCES:                                                                          ║
+║   ══════════════════════════════                                                                          ║
+║                                                                                                           ║
+║   1. Vision Encoder (ViT): Only in VL models, processes images/videos into token embeddings              ║
+║   2. DeepStack: Only in VL models, injects multi-scale vision features into early LLM layers             ║
+║   3. M-RoPE: VL models use 3D positional encoding (height, width, time) vs 1D in text-only               ║
+║   4. EVS: Only in VL models, prunes redundant video frames for efficiency                                 ║
+║   5. Memory: VL models require ~500M-2B extra parameters for vision processing                           ║
+║                                                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+### Qwen3 Text-Only Model Specifications
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              QWEN3 TEXT-ONLY LLM SPECIFICATIONS                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│  ┌────────────┬──────────┬─────────────┬────────┬─────────┬────────┬──────────┬────────────────────┐   │
+│  │ Model      │ Params   │ Hidden Size │ Layers │ Heads   │KV Heads│ Intermed │ Context            │   │
+│  ├────────────┼──────────┼─────────────┼────────┼─────────┼────────┼──────────┼────────────────────┤   │
+│  │ Qwen3-0.6B │ 0.6B     │ 1024        │ 28     │ 16      │ 8      │ 3072     │ 32K (131K w/ YaRN) │   │
+│  │ Qwen3-1.7B │ 1.7B     │ 1536        │ 28     │ 12      │ 4      │ 8960     │ 32K (131K w/ YaRN) │   │
+│  │ Qwen3-4B   │ 4.0B     │ 2560        │ 36     │ 32      │ 8      │ 9728     │ 32K (131K w/ YaRN) │   │
+│  │ Qwen3-8B   │ 8.0B     │ 4096        │ 36     │ 32      │ 8      │ 12288    │ 32K (131K w/ YaRN) │   │
+│  │ Qwen3-14B  │ 14.0B    │ 5120        │ 40     │ 40      │ 8      │ 13824    │ 32K (131K w/ YaRN) │   │
+│  │ Qwen3-32B  │ 32.0B    │ 5120        │ 64     │ 64      │ 8      │ 25600    │ 32K (131K w/ YaRN) │   │
+│  └────────────┴──────────┴─────────────┴────────┴─────────┴────────┴──────────┴────────────────────┘   │
+│                                                                                                         │
+│  MoE MODELS:                                                                                            │
+│  ┌────────────────────┬───────────┬─────────────┬────────┬─────────┬─────────┬────────────────────────┐│
+│  │ Model              │ Total/Act │ Hidden Size │ Layers │ Experts │ Top-K   │ Context                ││
+│  ├────────────────────┼───────────┼─────────────┼────────┼─────────┼─────────┼────────────────────────┤│
+│  │ Qwen3-30B-A3B      │ 30B / 3B  │ 2048        │ 48     │ 128     │ 8       │ 32K (131K w/ YaRN)     ││
+│  │ Qwen3-235B-A22B    │ 235B / 22B│ 5120        │ 94     │ 128     │ 8       │ 32K (131K w/ YaRN)     ││
+│  └────────────────────┴───────────┴─────────────┴────────┴─────────┴─────────┴────────────────────────┘│
+│                                                                                                         │
+│  COMMON FEATURES:                                                                                       │
+│  • Activation: SwiGLU (SiLU-gated linear unit)                                                         │
+│  • Normalization: RMSNorm                                                                              │
+│  • Position Encoding: RoPE (Rotary Position Embedding)                                                 │
+│  • Attention: Grouped Query Attention (GQA)                                                            │
+│  • Vocabulary: 151,936 tokens                                                                          │
+│  • Thinking Mode: Unified thinking/non-thinking in single model                                        │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -403,6 +527,563 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
 ║        --max-model-len 32768                                                                              ║
 ║                                                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## Complete Architecture Diagrams
+
+### Qwen3-VL Full Model Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              QWEN3-VL COMPLETE ARCHITECTURE DIAGRAM                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   INPUT STAGE                                                                                           │
+│   ══════════                                                                                            │
+│                                                                                                         │
+│   ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐                                   │
+│   │ Image            │   │ Video            │   │ Text             │                                   │
+│   │ (any resolution) │   │ (multi-frame)    │   │ (prompt)         │                                   │
+│   └────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘                                   │
+│            │                      │                      │                                              │
+│            ▼                      ▼                      │                                              │
+│   ┌─────────────────────────────────────────────┐        │                                              │
+│   │              VISION ENCODER                 │        │                                              │
+│   │  ┌───────────────────────────────────────┐  │        │                                              │
+│   │  │ 1. Patch Embedding (Conv3D)           │  │        │                                              │
+│   │  │    • Kernel: (2, 14, 14)              │  │        │                                              │
+│   │  │    • Stride: (2, 14, 14)              │  │        │                                              │
+│   │  │    • WITH bias (diff from Qwen2-VL)   │  │        │                                              │
+│   │  │    • Output: (num_patches, hidden)    │  │        │                                              │
+│   │  └───────────────────────────────────────┘  │        │                                              │
+│   │                     │                        │        │                                              │
+│   │                     ▼                        │        │                                              │
+│   │  ┌───────────────────────────────────────┐  │        │                                              │
+│   │  │ 2. Position Embedding                 │  │        │                                              │
+│   │  │    • Learned embeddings               │  │        │                                              │
+│   │  │    • Bilinear interpolation           │  │        │                                              │
+│   │  │    • Handles arbitrary resolutions    │  │        │                                              │
+│   │  └───────────────────────────────────────┘  │        │                                              │
+│   │                     │                        │        │                                              │
+│   │                     ▼                        │        │                                              │
+│   │  ┌───────────────────────────────────────┐  │        │                                              │
+│   │  │ 3. Vision Transformer Blocks          │  │        │                                              │
+│   │  │    ┌───────────────────────────────┐  │  │        │                                              │
+│   │  │    │ Block 0-7 ──┬─────────────────┼──┼──┼───► DS Merger 0 ──┐                                  │
+│   │  │    │ Block 8-15 ─┼─────────────────┼──┼──┼───► DS Merger 1 ──┼─► DeepStack                      │
+│   │  │    │ Block 16-23─┼─────────────────┼──┼──┼───► DS Merger 2 ──┘   Features                       │
+│   │  │    │ Block 24-31 ┴─────────────────┘  │  │                                                       │
+│   │  │    │                                   │  │                                                       │
+│   │  │    │ Each block:                       │  │                                                       │
+│   │  │    │ • LayerNorm                       │  │                                                       │
+│   │  │    │ • Self-Attention (partial RoPE)  │  │                                                       │
+│   │  │    │ • LayerNorm                       │  │                                                       │
+│   │  │    │ • MLP (SiLU, no bias)            │  │                                                       │
+│   │  │    └───────────────────────────────┘  │  │                                                       │
+│   │  └───────────────────────────────────────┘  │                                                       │
+│   │                     │                        │                                                       │
+│   │                     ▼                        │                                                       │
+│   │  ┌───────────────────────────────────────┐  │                                                       │
+│   │  │ 4. Patch Merger                       │  │                                                       │
+│   │  │    • Merge 2×2 patches → 1 token      │  │                                                       │
+│   │  │    • Reduces tokens by 4×             │  │                                                       │
+│   │  │    • Projects to LLM hidden size      │  │                                                       │
+│   │  └───────────────────────────────────────┘  │                                                       │
+│   │                     │                        │                                                       │
+│   └─────────────────────┼────────────────────────┘                                                       │
+│                         │                                                                                │
+│                         ▼                                                                                │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                              SEQUENCE MERGING                                                    │   │
+│   │  ┌───────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│   │  │ [<vision_start>] [vis_0] [vis_1] ... [vis_N] [<vision_end>] [text_0] [text_1] ... [text_M]│ │   │
+│   │  │                                                                                           │ │   │
+│   │  │ Visual tokens with M-RoPE positions:                                                      │ │   │
+│   │  │ • Temporal ID: frame number                                                               │ │   │
+│   │  │ • Height ID: row in image                                                                 │ │   │
+│   │  │ • Width ID: column in image                                                               │ │   │
+│   │  └───────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│   └─────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                           │                                                              │
+│                                           ▼                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                              QWEN3 LLM DECODER                                                   │   │
+│   │  ┌───────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│   │  │ Layer 0:  hidden_states + DeepStack_features_0  ← Multi-scale injection                  │ │   │
+│   │  │ Layer 1:  hidden_states + DeepStack_features_1  ← Multi-scale injection                  │ │   │
+│   │  │ Layer 2:  hidden_states + DeepStack_features_2  ← Multi-scale injection                  │ │   │
+│   │  │ Layer 3+: hidden_states only                                                              │ │   │
+│   │  │                                                                                           │ │   │
+│   │  │ Each layer:                                                                               │ │   │
+│   │  │ ┌─────────────────────────────────────────────────────────────────────────────────────┐  │ │   │
+│   │  │ │ • RMSNorm                                                                           │  │ │   │
+│   │  │ │ • Self-Attention (GQA with RoPE)                                                    │  │ │   │
+│   │  │ │   - Q, K, V projections (QKVParallelLinear)                                        │  │ │   │
+│   │  │ │   - PagedAttention (vLLM) or FlashAttention                                        │  │ │   │
+│   │  │ │   - Output projection (RowParallelLinear)                                          │  │ │   │
+│   │  │ │ • RMSNorm                                                                           │  │ │   │
+│   │  │ │ • MLP (SwiGLU activation)                                                           │  │ │   │
+│   │  │ │   - Gate + Up projection (MergedColumnParallelLinear)                              │  │ │   │
+│   │  │ │   - Down projection (RowParallelLinear)                                            │  │ │   │
+│   │  │ └─────────────────────────────────────────────────────────────────────────────────────┘  │ │   │
+│   │  └───────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│   │                                           │                                                      │   │
+│   │                                           ▼                                                      │   │
+│   │  ┌───────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│   │  │ Final RMSNorm → LM Head (ParallelLMHead) → Logits                                        │ │   │
+│   │  └───────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│   └─────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                           │                                                              │
+│                                           ▼                                                              │
+│   OUTPUT: Generated text tokens                                                                          │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Model Size Comparison Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              MODEL SIZE COMPARISON (DENSE MODELS)                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   Parameters (billions)                                                                                 │
+│   │                                                                                                     │
+│   35│                                             ┌───────┐                                             │
+│     │                                             │ 33B   │ ← Qwen3-VL-32B                             │
+│   30│                                             │       │   (32B LLM + 1B ViT)                       │
+│     │                                             │       │                                             │
+│   25│                                             │       │                                             │
+│     │                                             │       │                                             │
+│   20│                                             │       │                                             │
+│     │                                             │       │                                             │
+│   15│                                             │       │                                             │
+│     │                                             │       │                                             │
+│   10│                         ┌───────┐           │       │                                             │
+│     │                         │ 8.5B  │           │       │                                             │
+│    8│                         │       │           │       │ ← Qwen3-VL-8B (8B LLM + 500M ViT)          │
+│     │               ┌───────┐ │       │           │       │                                             │
+│    5│               │ 4.5B  │ │       │           │       │ ← Qwen3-VL-4B (4B LLM + 500M ViT)          │
+│     │     ┌───────┐ │       │ │       │           │       │                                             │
+│    2│     │ 2.5B  │ │       │ │       │           │       │ ← Qwen3-VL-2B (2B LLM + 500M ViT)          │
+│     │     │       │ │       │ │       │           │       │                                             │
+│    0│─────┴───────┴─┴───────┴─┴───────┴───────────┴───────┴─────────────────────────────────────────    │
+│          VL-2B     VL-4B     VL-8B               VL-32B                                                 │
+│                                                                                                         │
+│   ═══════════════════════════════════════════════════════════════════════════════════════════════       │
+│                                                                                                         │
+│                              MODEL SIZE COMPARISON (MOE MODELS)                                         │
+│                                                                                                         │
+│   Total Parameters (gray) vs Active Parameters (blue)                                                   │
+│   │                                                                                                     │
+│   250│                                                    ┌─────────┐                                   │
+│      │                                                    │░░░░░░░░░│ ← 237B Total                      │
+│   200│                                                    │░░░░░░░░░│   (235B LLM + 2B ViT)            │
+│      │                                                    │░░░░░░░░░│                                   │
+│   150│                                                    │░░░░░░░░░│                                   │
+│      │                                                    │░░░░░░░░░│                                   │
+│   100│                                                    │░░░░░░░░░│                                   │
+│      │                                                    │░░░░░░░░░│                                   │
+│    50│                  ┌─────────┐                       │░░░░░░░░░│                                   │
+│      │                  │░░░░░░░░░│ ← 31B Total           │░░░░░░░░░│                                   │
+│    25│                  │░░░░░░░░░│   (30B LLM + 1B ViT)  │████████ │ ← 22B Active                     │
+│      │                  │███████ │ ← 3B Active           │████████ │                                   │
+│     0│──────────────────┴─────────┴───────────────────────┴─────────┴───────────────────────────────    │
+│                     VL-30B-A3B                     VL-235B-A22B                                         │
+│                                                                                                         │
+│   Legend: ░░░ = Total parameters (in memory)    ███ = Active parameters (per token compute)            │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## vLLM PagedAttention for Multimodal
+
+Understanding how vLLM's PagedAttention handles vision-language models:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              VLLM PAGEDATTENTION FOR MULTIMODAL                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   THE PROBLEM: Variable-Length KV Cache                                                                 │
+│   ═════════════════════════════════════                                                                 │
+│                                                                                                         │
+│   Request 1: [1024×1024 image]  → 1332 visual tokens + 100 text = 1432 tokens                          │
+│   Request 2: [Video, 50 frames] → 8000 visual tokens + 50 text = 8050 tokens                           │
+│   Request 3: [Text only]        → 0 visual tokens + 500 text = 500 tokens                               │
+│                                                                                                         │
+│   Traditional allocation: Pre-allocate max_tokens for every request → HUGE waste!                      │
+│                                                                                                         │
+│   NAIVE ALLOCATION (Wasteful):                                                                          │
+│   ════════════════════════════                                                                          │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │ Request 1: [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  │   │
+│   │ Request 2: [██████████████████████████████████████████████████████████████████░░░░░░░░░░░░░░]  │   │
+│   │ Request 3: [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  │   │
+│   │                                                                                                │   │
+│   │            ████ = Used memory     ░░░░ = Wasted (pre-allocated but empty)                     │   │
+│   │            Memory utilization: ~30%                                                            │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   PAGEDATTENTION (Efficient):                                                                           │
+│   ═══════════════════════════                                                                           │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │   Physical Memory Pool (Pages):                                                                │   │
+│   │   ┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐        │   │
+│   │   │ P0  ││ P1  ││ P2  ││ P3  ││ P4  ││ P5  ││ P6  ││ P7  ││ P8  ││ P9  ││P10  ││ ...│        │   │
+│   │   │Req1 ││Req1 ││Req1 ││Req2 ││Req2 ││Req2 ││Req2 ││Req2 ││Req3 ││Free ││Free ││    │        │   │
+│   │   └─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘        │   │
+│   │                                                                                                │   │
+│   │   Virtual → Physical Mapping (Block Tables):                                                   │   │
+│   │   ┌─────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│   │   │ Request 1: [P0, P1, P2, _, _, _]           (3 pages allocated)                          │ │   │
+│   │   │ Request 2: [P3, P4, P5, P6, P7, _]         (5 pages allocated)                          │ │   │
+│   │   │ Request 3: [P8, _, _, _, _, _]             (1 page allocated)                           │ │   │
+│   │   └─────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│   │                                                                                                │   │
+│   │   Memory utilization: ~95%                                                                     │   │
+│   │   Pages allocated on-demand, freed when request completes                                     │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   ─────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                         │
+│   MULTIMODAL-SPECIFIC OPTIMIZATIONS:                                                                    │
+│   ══════════════════════════════════                                                                    │
+│                                                                                                         │
+│   1. PREFIX CACHING FOR VISUAL TOKENS                                                                   │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │   Turn 1: [System Prompt] + [Image Tokens] + [Question 1]                                     │   │
+│   │                              └──── CACHED ────┘                                                │   │
+│   │                                                                                                │   │
+│   │   Turn 2: [System Prompt] + [Image Tokens] + [Question 2]                                     │   │
+│   │           └──── REUSED ────┘ └── REUSED ──┘                                                   │   │
+│   │                                                                                                │   │
+│   │   BENEFIT: Image tokens computed once, reused across conversation turns                       │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   2. EVS (EFFICIENT VIDEO SAMPLING) INTEGRATION                                                         │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │   100-frame video without EVS:                                                                 │   │
+│   │   [F1][F2][F3][F4][F5][F6]...[F100] → 16,000 tokens → 64 pages → May OOM                      │   │
+│   │                                                                                                │   │
+│   │   100-frame video with EVS (50% pruning):                                                     │   │
+│   │   [F1][  ][F3][  ][F5][  ]...[F99 ] → 8,000 tokens → 32 pages → Fits!                        │   │
+│   │                                                                                                │   │
+│   │   Similar frames pruned BEFORE encoding → fewer tokens → fewer pages → more concurrency       │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   3. CHUNKED PREFILL FOR LONG VISUAL SEQUENCES                                                          │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │   Standard: Encode entire 50K token sequence → Wait → Start generating                        │   │
+│   │                                                                                                │   │
+│   │   Chunked:  Encode 5K chunk → Start generating → Continue encoding in background              │   │
+│   │                                                                                                │   │
+│   │   BENEFIT: ~30% faster time-to-first-token for long videos                                   │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## GPU Memory Layout Diagrams
+
+### T4 (16GB) Memory Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              T4 (16GB) MEMORY LAYOUT - Qwen3-VL-4B (4-bit)                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   GPU Memory: 16,384 MB                                                                                 │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Model Weights (4-bit BitsAndBytes)                                    ~2,000 MB (12%)  │   │   │
+│   │  │ ████████████████████                                                                   │   │   │
+│   │  │ • LLM: 4B params × 0.5 bytes = 2,000 MB                                               │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Vision Encoder (FP16, can't quantize easily)                          ~1,000 MB (6%)   │   │   │
+│   │  │ ██████████                                                                             │   │   │
+│   │  │ • ViT: 500M params × 2 bytes = 1,000 MB                                               │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ KV Cache (4K context × 4 requests × FP16)                             ~3,000 MB (18%)  │   │   │
+│   │  │ ██████████████████████████████                                                         │   │   │
+│   │  │ • 2 × 36 layers × 4 kv_heads × 128 head_dim × 4K × 4 seqs × 2 bytes                  │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Activations (intermediate tensors)                                    ~2,000 MB (12%)  │   │   │
+│   │  │ ████████████████████                                                                   │   │   │
+│   │  │ • MLP intermediate, attention scores, etc.                                            │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Visual Token Buffer (1024×1024 image)                                 ~1,500 MB (9%)   │   │   │
+│   │  │ ███████████████                                                                        │   │   │
+│   │  │ • Patch embeddings during vision encoding                                              │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ CUDA Overhead / Reserved                                              ~1,500 MB (9%)   │   │   │
+│   │  │ ███████████████                                                                        │   │   │
+│   │  │ • CUDA context, driver, workspace                                                      │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ FREE MEMORY                                                           ~5,384 MB (34%)  │   │   │
+│   │  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                                │   │   │
+│   │  │ • Available for additional KV cache pages                                              │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  TOTAL USED: ~11,000 MB (67%)     FREE: ~5,384 MB (33%)                                       │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   LIMITATIONS:                                                                                          │
+│   • No BF16 (FP16 only)                                                                                │
+│   • No FlashAttention 2 (uses TORCH_SDPA)                                                              │
+│   • 320 GB/s bandwidth (memory-bound during decode)                                                    │
+│                                                                                                         │
+│   RECOMMENDED CONFIG:                                                                                   │
+│   • enforce_eager=True (saves ~500 MB by disabling CUDA graphs)                                        │
+│   • max_model_len=4096                                                                                 │
+│   • max_num_seqs=4                                                                                     │
+│   • max_pixels=500000 (~700×700)                                                                       │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### A100-80GB Memory Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              A100-80GB MEMORY LAYOUT - Qwen3-VL-8B (BF16)                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   GPU Memory: 81,920 MB                                                                                 │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Model Weights (BF16 full precision)                                  ~17,000 MB (21%)  │   │   │
+│   │  │ ██████████████████████████████████                                                     │   │   │
+│   │  │ • LLM: 8B params × 2 bytes = 16,000 MB                                                │   │   │
+│   │  │ • Vision: 500M × 2 bytes = 1,000 MB                                                    │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ KV Cache (32K context × 32 requests × BF16)                          ~24,000 MB (29%)  │   │   │
+│   │  │ ████████████████████████████████████████████████                                       │   │   │
+│   │  │ • Managed by PagedAttention                                                            │   │   │
+│   │  │ • 2 × 32 layers × 8 kv_heads × 128 head_dim × 32K × 32 seqs × 2 bytes                │   │   │
+│   │  │ • Pages allocated dynamically as needed                                                │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Activations + CUDA Graphs                                             ~8,000 MB (10%)  │   │   │
+│   │  │ ████████████████                                                                       │   │   │
+│   │  │ • CUDA graphs enabled for faster decode                                                │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Prefix Cache (shared system prompts)                                  ~3,000 MB (4%)   │   │   │
+│   │  │ ██████                                                                                 │   │   │
+│   │  │ • Cached KV for repeated prefixes                                                      │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ FREE MEMORY                                                          ~29,920 MB (36%)  │   │   │
+│   │  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                          │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  TOTAL USED: ~52,000 MB (64%)     FREE: ~29,920 MB (36%)                                      │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   ADVANTAGES:                                                                                           │
+│   • Native BF16 support (better numerical stability)                                                   │
+│   • FlashAttention 2 (2-4× faster attention)                                                           │
+│   • 2,039 GB/s bandwidth (6× faster than T4)                                                           │
+│   • Tensor cores for mixed precision                                                                   │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### H100-80GB Memory Layout (with FP8)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              H100-80GB MEMORY LAYOUT - Qwen3-VL-8B (FP8)                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   GPU Memory: 81,920 MB                                                                                 │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Model Weights (FP8 quantized)                                         ~8,500 MB (10%)  │   │   │
+│   │  │ █████████████████                                                                      │   │   │
+│   │  │ • LLM: 8B params × 1 byte = 8,000 MB                                                  │   │   │
+│   │  │ • Vision: 500M × 1 byte = 500 MB                                                       │   │   │
+│   │  │ ← 50% smaller than BF16!                                                               │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ KV Cache (FP8, 32K context × 64 requests)                            ~16,000 MB (20%)  │   │   │
+│   │  │ ████████████████████████████████                                                       │   │   │
+│   │  │ • FP8 KV cache = 50% smaller than BF16                                                │   │   │
+│   │  │ • Can serve 2× more concurrent requests!                                               │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Activations + FlashAttention 3 workspace                              ~6,000 MB (7%)   │   │   │
+│   │  │ ████████████                                                                           │   │   │
+│   │  │ • FlashAttention 3 optimized for Hopper                                                │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ FREE MEMORY                                                          ~51,420 MB (63%)  │   │   │
+│   │  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│   │   │
+│   │  │ • Room for 64+ concurrent image requests                                               │   │   │
+│   │  │ • Can scale to 128 concurrent with smaller images                                      │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  TOTAL USED: ~30,500 MB (37%)     FREE: ~51,420 MB (63%)                                      │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   FP8 BENEFITS:                                                                                         │
+│   • Weights: 17 GB → 8.5 GB (50% reduction)                                                            │
+│   • KV Cache: 24 GB → 12 GB (50% reduction)                                                            │
+│   • Throughput: ~2× faster matmul operations                                                           │
+│   • Quality: <1% accuracy loss for most VLM tasks                                                      │
+│                                                                                                         │
+│   ADDITIONAL H100 ADVANTAGES:                                                                           │
+│   • FlashAttention 3 (Hopper-specific optimizations)                                                   │
+│   • 3,350 GB/s bandwidth (10× faster than T4)                                                          │
+│   • Transformer Engine for automatic mixed precision                                                   │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### B200-192GB Memory Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              B200-192GB MEMORY LAYOUT - Qwen3-VL-32B (BF16)                             │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   GPU Memory: 196,608 MB                                                                                │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Model Weights (BF16 full precision)                                  ~66,000 MB (34%)  │   │   │
+│   │  │ ██████████████████████████████████████████████████████████████████████                 │   │   │
+│   │  │ • LLM: 32B params × 2 bytes = 64,000 MB                                               │   │   │
+│   │  │ • Vision: 1B × 2 bytes = 2,000 MB                                                      │   │   │
+│   │  │ ← Single GPU! No tensor parallelism needed!                                            │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ KV Cache (128K context × 128 requests × BF16)                        ~60,000 MB (30%)  │   │   │
+│   │  │ ████████████████████████████████████████████████████████████                           │   │   │
+│   │  │ • Massive context window supported                                                     │   │   │
+│   │  │ • 2 × 64 layers × 8 kv_heads × 128 head_dim × 128K × 128 seqs × 2 bytes              │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ Activations + 4K resolution images                                   ~20,000 MB (10%)  │   │   │
+│   │  │ ████████████████████████████████████████                                               │   │   │
+│   │  │ • max_pixels=4,147,200 (4K resolution)                                                │   │   │
+│   │  │ • Multiple 4K images simultaneously                                                    │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  ┌────────────────────────────────────────────────────────────────────────────────────────┐   │   │
+│   │  │ FREE MEMORY                                                          ~50,608 MB (26%)  │   │   │
+│   │  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                                │   │   │
+│   │  │ • Headroom for even larger batches                                                     │   │   │
+│   │  └────────────────────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                                                                                                │   │
+│   │  TOTAL USED: ~146,000 MB (74%)     FREE: ~50,608 MB (26%)                                     │   │
+│   │                                                                                                │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                         │
+│   B200 ADVANTAGES:                                                                                      │
+│   • 192 GB HBM3e (12× T4, 2.4× H100)                                                                   │
+│   • 8,000 GB/s bandwidth (25× faster than T4)                                                          │
+│   • FP4 support (when available, 4× throughput potential)                                              │
+│   • Run 32B model on SINGLE GPU                                                                        │
+│   • 128K context with 128 concurrent requests                                                          │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Performance Benchmarks
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PERFORMANCE BENCHMARKS BY GPU                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                         │
+│   SINGLE IMAGE INFERENCE (1024×1024, 256 output tokens):                                                │
+│   ══════════════════════════════════════════════════════                                                │
+│                                                                                                         │
+│   ┌────────────────────┬────────────────────┬────────────────────┬────────────────────┐                │
+│   │ Model              │ T4 (16GB)          │ A100-80GB          │ H100-80GB (FP8)    │                │
+│   ├────────────────────┼────────────────────┼────────────────────┼────────────────────┤                │
+│   │ Qwen3-VL-2B        │ 600ms, 25 tok/s    │ 100ms, 150 tok/s   │ 50ms, 300 tok/s    │                │
+│   │ Qwen3-VL-4B        │ 1000ms*, 18 tok/s  │ 150ms, 120 tok/s   │ 80ms, 220 tok/s    │                │
+│   │ Qwen3-VL-8B        │ 1800ms*, 10 tok/s  │ 250ms, 80 tok/s    │ 120ms, 150 tok/s   │                │
+│   │ Qwen3-VL-32B       │ ❌ OOM             │ 500ms, 40 tok/s    │ 250ms, 80 tok/s    │                │
+│   │ Qwen3-VL-30B-A3B   │ ❌ OOM             │ 350ms, 50 tok/s    │ 180ms, 100 tok/s   │                │
+│   └────────────────────┴────────────────────┴────────────────────┴────────────────────┘                │
+│   * = Requires 4-bit quantization                                                                       │
+│                                                                                                         │
+│   ─────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                         │
+│   VIDEO INFERENCE (60s video, 100 frames, 256 output tokens):                                           │
+│   ═══════════════════════════════════════════════════════════                                           │
+│                                                                                                         │
+│   ┌────────────────────┬────────────────────┬────────────────────┬────────────────────┐                │
+│   │ Model              │ Without EVS        │ With EVS (50%)     │ Speed Improvement  │                │
+│   ├────────────────────┼────────────────────┼────────────────────┼────────────────────┤                │
+│   │ Qwen3-VL-8B (A100) │ 4.5s, 16K tokens   │ 2.5s, 8K tokens    │ 1.8× faster        │                │
+│   │ Qwen3-VL-8B (H100) │ 2.0s, 16K tokens   │ 1.1s, 8K tokens    │ 1.8× faster        │                │
+│   │ Qwen3-VL-32B (H100)│ 4.0s, 16K tokens   │ 2.2s, 8K tokens    │ 1.8× faster        │                │
+│   └────────────────────┴────────────────────┴────────────────────┴────────────────────┘                │
+│                                                                                                         │
+│   ─────────────────────────────────────────────────────────────────────────────────────────────────────│
+│                                                                                                         │
+│   THROUGHPUT (Concurrent requests, mixed image sizes):                                                  │
+│   ═══════════════════════════════════════════════════════                                               │
+│                                                                                                         │
+│   ┌────────────────────┬────────────────────┬────────────────────┬────────────────────┐                │
+│   │ GPU                │ Max Concurrent     │ Throughput (req/s) │ p95 Latency        │                │
+│   ├────────────────────┼────────────────────┼────────────────────┼────────────────────┤                │
+│   │ T4 (Qwen3-VL-4B)   │ 4                  │ ~1                 │ ~2000ms            │                │
+│   │ A100-80GB (8B)     │ 32                 │ ~6                 │ ~500ms             │                │
+│   │ H100-80GB (8B FP8) │ 64                 │ ~12                │ ~300ms             │                │
+│   │ B200-192GB (32B)   │ 128                │ ~20                │ ~200ms             │                │
+│   └────────────────────┴────────────────────┴────────────────────┴────────────────────┘                │
+│                                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -821,10 +1502,175 @@ vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
 
 ---
 
+---
+
+## Executive Summary: Key Takeaways by Role
+
+### For CEOs / Business Leaders
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              EXECUTIVE SUMMARY                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   WHAT IS QWEN3-VL?                                                                             │
+│   A state-of-the-art AI that understands both images and text, enabling:                       │
+│   • Automated GUI agents (MAI-UI) that can control computers/phones                            │
+│   • Document understanding and analysis                                                         │
+│   • Video comprehension for content moderation, security, etc.                                 │
+│                                                                                                 │
+│   ROI CONSIDERATIONS:                                                                           │
+│   ┌─────────────────────┬────────────────┬────────────────┬────────────────────┐               │
+│   │ Workload Scale      │ GPU Choice     │ Monthly Cost*  │ Requests/day       │               │
+│   ├─────────────────────┼────────────────┼────────────────┼────────────────────┤               │
+│   │ Prototype/Dev       │ 1× T4          │ ~$100          │ ~5,000             │               │
+│   │ Small Production    │ 1× A100-40GB   │ ~$1,000        │ ~50,000            │               │
+│   │ Medium Production   │ 1× H100        │ ~$3,000        │ ~200,000           │               │
+│   │ Enterprise Scale    │ 8× H100        │ ~$25,000       │ ~1,000,000+        │               │
+│   └─────────────────────┴────────────────┴────────────────┴────────────────────┘               │
+│   *Approximate cloud GPU rental costs                                                          │
+│                                                                                                 │
+│   KEY DECISION: Model quality scales with size, but so does cost.                              │
+│   • 8B model: Good quality, reasonable cost, fits most use cases                              │
+│   • 32B model: Best quality, 4× cost, for demanding applications                              │
+│   • MoE models: 32B quality at 8B cost, but requires more memory                              │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### For CTOs / Engineering Managers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              TECHNICAL STRATEGY                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   ARCHITECTURE DECISION TREE:                                                                   │
+│                                                                                                 │
+│   ┌────────────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                                                                                        │   │
+│   │   Q1: What's your latency requirement?                                                 │   │
+│   │   ├─ < 200ms → H100 with FP8, or B200                                                 │   │
+│   │   ├─ < 500ms → A100-80GB with BF16                                                    │   │
+│   │   └─ < 1000ms → T4 with 4-bit quantization (cost-optimized)                           │   │
+│   │                                                                                        │   │
+│   │   Q2: What's your quality requirement?                                                 │   │
+│   │   ├─ SOTA benchmarks → Qwen3-VL-32B or 235B-A22B                                      │   │
+│   │   ├─ Production quality → Qwen3-VL-8B (sweet spot)                                    │   │
+│   │   └─ Good enough → Qwen3-VL-4B (3× faster, 80% quality)                               │   │
+│   │                                                                                        │   │
+│   │   Q3: What's your concurrency requirement?                                             │   │
+│   │   ├─ 100+ concurrent → B200 or multi-GPU H100                                         │   │
+│   │   ├─ 10-50 concurrent → H100 with FP8 KV cache                                        │   │
+│   │   └─ < 10 concurrent → A100-40GB sufficient                                           │   │
+│   │                                                                                        │   │
+│   └────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                 │
+│   INFRASTRUCTURE RECOMMENDATIONS:                                                               │
+│   • Use vLLM (not HuggingFace) for 3-5× better throughput                                     │
+│   • Enable PagedAttention (default in vLLM) for memory efficiency                             │
+│   • Enable prefix caching for multi-turn conversations                                         │
+│   • Use FP8 on H100 for 2× throughput with <1% quality loss                                   │
+│   • Consider MoE models for cost-efficiency at scale                                          │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### For Engineers / Developers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              IMPLEMENTATION GUIDE                                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   QUICK START (copy-paste ready):                                                               │
+│                                                                                                 │
+│   # For development (Colab T4):                                                                │
+│   vllm serve Qwen/Qwen3-VL-2B-Instruct \                                                       │
+│     --dtype float16 \                                                                           │
+│     --max-model-len 4096 \                                                                      │
+│     --gpu-memory-utilization 0.85 \                                                             │
+│     --enforce-eager                                                                             │
+│                                                                                                 │
+│   # For production (A100-80GB):                                                                │
+│   vllm serve Qwen/Qwen3-VL-8B-Instruct \                                                       │
+│     --dtype bfloat16 \                                                                          │
+│     --max-model-len 32768 \                                                                     │
+│     --max-num-seqs 32 \                                                                         │
+│     --enable-prefix-caching \                                                                   │
+│     --enable-chunked-prefill                                                                    │
+│                                                                                                 │
+│   # For high-throughput (H100):                                                                │
+│   vllm serve Qwen/Qwen3-VL-8B-Instruct \                                                       │
+│     --quantization fp8 \                                                                        │
+│     --kv-cache-dtype fp8 \                                                                      │
+│     --max-num-seqs 64 \                                                                         │
+│     --enable-prefix-caching                                                                     │
+│                                                                                                 │
+│   ─────────────────────────────────────────────────────────────────────────────────────────    │
+│                                                                                                 │
+│   DEBUGGING CHECKLIST:                                                                          │
+│   □ OOM errors → Reduce max_model_len, max_num_seqs, or max_pixels                            │
+│   □ Slow first token → Enable chunked_prefill for long contexts                               │
+│   □ Slow decode → Check bandwidth (T4 is 6× slower than H100)                                 │
+│   □ Quality issues → Check dtype (BF16 > FP16 > FP8 > INT4)                                   │
+│   □ Video OOM → Enable EVS with video_pruning_rate=0.5                                        │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### For Interns / New Team Members
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              LEARNING PATH                                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   CONCEPT MAP (What you need to understand):                                                    │
+│                                                                                                 │
+│   Level 1: What is a VLM?                                                                       │
+│   ────────────────────────                                                                      │
+│   Vision + Language = Model that understands images AND text                                   │
+│   • Input: Image/Video + Text prompt ("What's in this picture?")                              │
+│   • Output: Text response ("A cat sitting on a windowsill")                                   │
+│                                                                                                 │
+│   Level 2: How does it work?                                                                    │
+│   ──────────────────────────                                                                    │
+│   1. Vision Encoder (ViT) converts image → tokens (numbers)                                   │
+│   2. Text Tokenizer converts text → tokens                                                     │
+│   3. LLM processes [image_tokens] + [text_tokens] together                                    │
+│   4. LLM generates response tokens one at a time                                              │
+│                                                                                                 │
+│   Level 3: What is vLLM?                                                                        │
+│   ──────────────────────                                                                        │
+│   vLLM = Very fast LLM inference engine                                                        │
+│   • PagedAttention: Efficient memory management (like virtual memory for AI)                  │
+│   • Continuous batching: Serve many users simultaneously                                      │
+│   • Prefix caching: Reuse computation for shared contexts                                     │
+│                                                                                                 │
+│   Level 4: Why different GPUs?                                                                  │
+│   ───────────────────────────                                                                   │
+│   • More VRAM = larger models, longer contexts, more concurrent users                         │
+│   • More bandwidth = faster token generation                                                  │
+│   • Newer architecture = more features (FP8, FlashAttention 3)                               │
+│                                                                                                 │
+│   RECOMMENDED READING ORDER:                                                                    │
+│   1. QWEN_VL_COMPLETE_GUIDE.md - Architecture & concepts                                       │
+│   2. This file - Model sizes & GPU configs                                                     │
+│   3. mai_ui_gpu_optimized.ipynb - Hands-on practice                                           │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## References
 
 - [Qwen3-VL Technical Report (arXiv:2511.21631)](https://arxiv.org/abs/2511.21631)
+- [Qwen3 Technical Report (arXiv:2505.09388)](https://arxiv.org/abs/2505.09388)
+- [MAI-UI Technical Report (arXiv:2512.22047)](https://arxiv.org/abs/2512.22047)
 - [Qwen3-VL GitHub Repository](https://github.com/QwenLM/Qwen3-VL)
 - [vLLM Qwen3-VL Usage Guide](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-VL.html)
 - [Hugging Face Qwen Collection](https://huggingface.co/Qwen)
+- [QWEN_VL_COMPLETE_GUIDE.md](./QWEN_VL_COMPLETE_GUIDE.md) - Companion architectural deep-dive
 

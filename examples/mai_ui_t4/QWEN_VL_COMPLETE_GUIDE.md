@@ -2,6 +2,13 @@
 
 A comprehensive guide to running Qwen2-VL and Qwen3-VL models on vLLM across different GPU architectures (T4, A100, H100, B200), including the MAI-UI GUI agent application.
 
+## Related Documentation
+
+| Document | Description |
+|----------|-------------|
+| **[QWEN3_VL_MODEL_SIZES.md](./QWEN3_VL_MODEL_SIZES.md)** | Complete breakdown of ALL Qwen3-VL model sizes (2B, 4B, 8B, 32B, MoE), detailed architecture specs, GPU memory layouts, vLLM deployment configs |
+| **[mai_ui_gpu_optimized.ipynb](./mai_ui_gpu_optimized.ipynb)** | Interactive notebook: auto-detects GPU, configures vLLM, runs MAI-UI inference |
+
 ---
 
 ## Introduction
@@ -29,25 +36,28 @@ This guide reviews their architectures and features, covering:
 3. [How Vision-Language Models Work](#how-vision-language-models-work)
 4. [Qwen2-VL vs Qwen3-VL Architecture](#qwen2-vl-vs-qwen3-vl-architecture)
 5. [GPU Hardware Guide](#gpu-hardware-guide)
-6. [vLLM Configuration Parameters](#vllm-configuration-parameters)
-7. [MAI-UI: GUI Agents with Reinforcement Learning](#mai-ui-gui-agents-with-reinforcement-learning)
-8. [Multimodal Support: Images, Video, and Advanced Mechanisms](#multimodal-support-images-video-and-advanced-mechanisms)
+6. [Qwen3-VL Model Sizes Overview](#qwen3-vl-model-sizes-overview)
+   - Dense Models vs MoE Models
+   - Memory Formula for vLLM
+7. [vLLM Configuration Parameters](#vllm-configuration-parameters)
+8. [MAI-UI: GUI Agents with Reinforcement Learning](#mai-ui-gui-agents-with-reinforcement-learning)
+9. [Multimodal Support: Images, Video, and Advanced Mechanisms](#multimodal-support-images-video-and-advanced-mechanisms)
    - Unified Image & Video Pipeline
    - Efficient Video Sampling (EVS)
    - DeepStack: Multi-Level Vision Features
-9. [Training and Inference Pipelines](#training-and-inference-pipelines)
-   - Three-Stage Training Regimen
-   - Inference Pipeline and vLLM Integration
-10. [Complete Code Examples](#complete-code-examples)
-11. [Comparative Analysis: Qwen2-VL vs Qwen3-VL](#comparative-analysis-qwen2-vl-vs-qwen3-vl)
+10. [Training and Inference Pipelines](#training-and-inference-pipelines)
+    - Three-Stage Training Regimen
+    - Inference Pipeline and vLLM Integration
+11. [Complete Code Examples](#complete-code-examples)
+12. [Comparative Analysis: Qwen2-VL vs Qwen3-VL](#comparative-analysis-qwen2-vl-vs-qwen3-vl)
     - Capability Improvements
     - Video Token Handling Comparison
     - Model Size and Architecture Comparison
     - Latency and Inference Performance
     - When to Choose Which Model
-12. [Summary: Key Differences at a Glance](#summary-key-differences-at-a-glance)
-13. [GPU Deployment Best Practices](#gpu-deployment-best-practices)
-14. [References](#references)
+13. [Summary: Key Differences at a Glance](#summary-key-differences-at-a-glance)
+14. [GPU Deployment Best Practices](#gpu-deployment-best-practices)
+15. [References](#references)
 
 ---
 
@@ -1182,6 +1192,87 @@ More tokens = More memory = Longer processing time
 ║  └────────────────────┴─────────────┴──────────────┴─────────────────────────────┘ ║
 ║                                                                                     ║
 ╚═════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## Qwen3-VL Model Sizes Overview
+
+> 📖 **For complete details**: See [QWEN3_VL_MODEL_SIZES.md](./QWEN3_VL_MODEL_SIZES.md) for full architecture specifications, GPU memory layouts, and deployment configs.
+
+### Dense Models vs MoE Models
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              QWEN3-VL MODEL FAMILY                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                 │
+│   DENSE MODELS (All parameters active)                                                          │
+│   ════════════════════════════════════                                                          │
+│   Every forward pass uses ALL model parameters.                                                 │
+│   Memory = Total Params × Precision Bytes                                                       │
+│                                                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────┐  │
+│   │ Model           │ Params   │ LLM Layers │ Hidden Size │ Min GPU        │ Best Use       │  │
+│   ├─────────────────┼──────────┼────────────┼─────────────┼────────────────┼────────────────┤  │
+│   │ Qwen3-VL-2B     │ 2.5B     │ 28         │ 1536        │ T4 (16GB)      │ Edge/Mobile    │  │
+│   │ Qwen3-VL-4B     │ 4.5B     │ 36         │ 2048        │ T4 (4-bit)     │ Cost-efficient │  │
+│   │ Qwen3-VL-8B     │ 8.5B     │ 32         │ 4096        │ A100-40GB      │ Production     │  │
+│   │ Qwen3-VL-32B    │ 33B      │ 64         │ 5120        │ A100-80GB      │ SOTA quality   │  │
+│   └─────────────────┴──────────┴────────────┴─────────────┴────────────────┴────────────────┘  │
+│                                                                                                 │
+│   MIXTURE OF EXPERTS (Only subset of experts active per token)                                 │
+│   ═══════════════════════════════════════════════════════════                                  │
+│   Memory = Total Params × Precision (must load ALL experts)                                    │
+│   Compute = Active Params × FLOPs (only active experts compute)                                │
+│                                                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────┐  │
+│   │ Model              │ Total    │ Active   │ Experts │ Min GPU         │ Best Use        │  │
+│   ├────────────────────┼──────────┼──────────┼─────────┼─────────────────┼─────────────────┤  │
+│   │ Qwen3-VL-30B-A3B   │ 31B      │ 3B       │ 128     │ A100-80GB       │ Cost/Quality    │  │
+│   │ Qwen3-VL-235B-A22B │ 237B     │ 22B      │ 128     │ 8×H100          │ Max capability  │  │
+│   └────────────────────┴──────────┴──────────┴─────────┴─────────────────┴─────────────────┘  │
+│                                                                                                 │
+│   KEY INSIGHT: MoE models have 32B-class quality at 8B-class compute cost!                    │
+│                                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Memory Formula for vLLM
+
+Understanding how memory is consumed helps optimize deployment:
+
+```
+Total GPU Memory = Model Weights + KV Cache + Activations + CUDA Overhead
+
+Where:
+  Model Weights = num_params × bytes_per_param
+    - FP16/BF16: 2 bytes
+    - FP8: 1 byte  
+    - INT4: 0.5 bytes
+
+  KV Cache = 2 × num_layers × kv_heads × head_dim × context_len × num_seqs × bytes
+    - This is where PagedAttention shines: only allocates what's needed
+
+  Activations = proportional to batch_size × hidden_size × seq_len
+    - Temporary tensors during forward pass
+
+  CUDA Overhead = ~500MB - 2GB depending on features
+    - CUDA graphs, JIT compilation, driver state
+```
+
+**Memory Budget by GPU (for Qwen3-VL-8B):**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ GPU         │ Total VRAM │ Model (BF16) │ KV Cache Available │ Max Concurrent Seqs  │
+├─────────────┼────────────┼──────────────┼────────────────────┼──────────────────────┤
+│ T4          │ 16 GB      │ ~17 GB       │ ❌ OOM (need INT4) │ N/A                  │
+│ A100-40GB   │ 40 GB      │ ~17 GB       │ ~20 GB             │ ~16 @ 8K context     │
+│ A100-80GB   │ 80 GB      │ ~17 GB       │ ~55 GB             │ ~32 @ 32K context    │
+│ H100 (FP8)  │ 80 GB      │ ~9 GB        │ ~65 GB             │ ~64 @ 32K context    │
+│ B200        │ 192 GB     │ ~17 GB       │ ~165 GB            │ ~128 @ 64K context   │
+└─────────────┴────────────┴──────────────┴────────────────────┴──────────────────────┘
 ```
 
 ---
