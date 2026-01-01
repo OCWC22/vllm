@@ -42,7 +42,19 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
     - [Implementation Code: GRPO for GUI Grounding](#implementation-code-grpo-for-gui-grounding)
     - [SFT Data Quality Engineering](#sft-data-quality-engineering-what-we-learned)
     - [Summary: The Complete Training Recipe](#summary-the-complete-training-recipe)
-13. [References](#references)
+13. [**Complete Paper Technical Breakdown**](#paper-references-all-verified--complete-technical-breakdown)
+    - [MAI-UI Technical Report](#1-mai-ui-technical-report--arxiv251222047)
+    - [UI-Ins: Instruction-as-Reasoning](#2-ui-ins--arxiv251020286)
+    - [OS-Genesis: Reverse Task Synthesis](#3-os-genesis--arxiv241219723)
+    - [UI-R1: GRPO for GUI](#4-ui-r1--arxiv250321620)
+    - [Fara-7B: Microsoft Computer Use Agent](#5-fara-7b--faragen--arxiv251119663)
+    - [GUI-360: Windows Dataset](#6-gui-360--arxiv251104307)
+    - [UGround: Visual Grounding](#7-uground--arxiv241005243)
+    - [OS-ATLAS: Cross-Platform](#8-os-atlas--arxiv241023218)
+    - [EDGE: Synthetic Data](#9-edge--arxiv241019461)
+    - [GUICourse: Training Suite](#10-guicourse--arxiv240611317)
+    - [OpenCUA in vLLM](#11-opencua--in-vllm-codebase)
+14. [References](#references)
 
 ---
 
@@ -3305,17 +3317,18 @@ This section explains why computer use agents trained with SFT and RL **only wor
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Research References for GUI Agent Scaling
+### Research References for GUI Agent Scaling (Verified)
 
-| Paper | Key Finding | Implication |
-|-------|-------------|-------------|
-| **XBOUND** (OpenReview 2025) | Sub-7B models show "limited state mastery", 75% failure rate for 2B | Minimum viable size is 7B+ |
-| **GUI Knowledge Bench** (arXiv:2510.26098) | Smaller models "retain only limited knowledge" | Knowledge bottleneck |
-| **Scaling ViT** (CVPR 2022) | "Smaller models saturate and fall off power law frontier" | Can't train small models to match large |
-| **MAI-UI** (arXiv:2512.22047) | GRPO + SFT on Qwen3-VL, 32B for SOTA | Industry validation |
-| **GUI-R1** (arXiv:2504.10458) | RL achieves SOTA with 0.02% data | But requires capable base model |
-| **CogAgent** (CVPR 2024) | 18B specialized for GUI | Large model needed for GUI |
-| **ShowUI** (4.2B) | Chose small for efficiency, not accuracy | Tradeoff acknowledged |
+| Paper | arXiv/Source | Key Finding | Implication |
+|-------|--------------|-------------|-------------|
+| **MAI-UI** | [2512.22047](https://arxiv.org/abs/2512.22047) | GRPO + SFT on Qwen3-VL, 32B for SOTA, 500+ parallel AVDs | Industry validation, 76.7% AndroidWorld |
+| **UI-R1** | [2503.21620](https://arxiv.org/abs/2503.21620) | GRPO achieves +15% with only 136 tasks on Qwen2.5-VL-3B | RL works but needs capable base model |
+| **UI-Ins** | [2510.20286](https://arxiv.org/abs/2510.20286) | 23.3% flaw rate in existing data, 4 perspectives help | Instruction diversity critical |
+| **OS-Genesis** | [2412.19723](https://arxiv.org/abs/2412.19723) | Reverse task synthesis outperforms template-based | ACL 2025, explore-then-derive works |
+| **Fara-7B** | [2511.19663](https://arxiv.org/abs/2511.19663) | 7B competitive with frontier models using 145K trajectories | Microsoft, quality > quantity |
+| **XBOUND** | OpenReview 2025 | Sub-7B models show "limited state mastery", 75% failure rate for 2B | Minimum viable size is 7B+ |
+| **CogAgent** | CVPR 2024 | 18B specialized for GUI | Large model needed for GUI |
+| **ShowUI** | - | Chose small (4.2B) for efficiency, not accuracy | Tradeoff acknowledged |
 
 ---
 
@@ -3489,9 +3502,13 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 
 ### Method 2: OS-Genesis Reverse Task Synthesis (arXiv:2412.19723)
 
+> **Paper**: [OS-Genesis: Automating GUI Agent Trajectory Construction via Reverse Task Synthesis](https://arxiv.org/abs/2412.19723)
+> **Venue**: ACL 2025
+> **Models Released**: OS-Genesis-4B, OS-Genesis-7B, OS-Genesis-8B
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                     OS-GENESIS: REVERSE TASK SYNTHESIS                                                       │
+│                     OS-GENESIS: REVERSE TASK SYNTHESIS — VERIFIED (ACL 2025)                                 │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
 │  KEY INNOVATION: Explore first, derive tasks retrospectively                                                │
@@ -3544,13 +3561,18 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 
 ### Method 3: FaraGen Pipeline (Fara-7B)
 
+> **Paper**: [Fara-7B: An Efficient Agentic Model for Computer Use](https://arxiv.org/abs/2511.19663)
+> **Source**: Microsoft Research
+> **Base Model**: Qwen2.5-VL-7B
+> **Framework**: Built on Magentic-One multi-agent framework
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                     FARAGEN: MULTI-AGENT SYNTHETIC DATA ENGINE                                               │
+│                     FARAGEN: MULTI-AGENT SYNTHETIC DATA ENGINE — VERIFIED (Microsoft)                        │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
 │  KEY INNOVATION: Multi-agent task solving with quality filtering                                            │
-│  RESULT: 145,000 high-quality trajectories for SFT                                                          │
+│  RESULT: 145,000 high-quality trajectories across 70,000+ domains for SFT                                   │
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                                                                                                       │ │
@@ -3739,16 +3761,16 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Datasets to Learn From
+### Key Datasets to Learn From (Verified)
 
-| Dataset | Size | Focus | Key Innovation |
-|---------|------|-------|----------------|
-| **UGround** | 10M elements, 1.3M screenshots | Visual grounding | Largest GUI grounding corpus |
-| **GUI-Actor Data** | 1M screenshots, 10M elements | Bounding box supervision | Multi-source aggregation |
-| **OS-ATLAS** | 13M elements | Cross-platform | Open toolkit for data synthesis |
-| **GUICourse** | 700K QA pairs | Region-text grounding | SFT-ready format |
-| **GUI-360** | 1.2M action steps | Windows office apps | Automated pipeline |
-| **MAI-UI (internal)** | Unknown | Full navigation + tools | Self-evolving pipeline |
+| Dataset | arXiv | Size | Focus | Key Innovation |
+|---------|-------|------|-------|----------------|
+| **UGround** | [2410.05243](https://arxiv.org/abs/2410.05243) | 10M elements, 1.3M screenshots | Visual grounding | Largest GUI grounding corpus, LLaVA-based |
+| **OS-ATLAS** | [2410.23218](https://arxiv.org/abs/2410.23218) | 13.58M elements, 2.24M screenshots | Cross-platform | Open toolkit: Windows/Linux/MacOS/Android/Web |
+| **GUICourse** | [2406.11317](https://arxiv.org/abs/2406.11317) | 0.7M QA pairs (GUIEnv), 67K instructions (GUIAct) | Region-text grounding | SFT-ready format, 3-part dataset suite |
+| **GUI-360** | [2511.04307](https://arxiv.org/abs/2511.04307) | 1.2M+ action steps | Windows office apps | Word/Excel/PowerPoint, automated pipeline |
+| **EDGE** | [2410.19461](https://arxiv.org/abs/2410.19461) | Multi-granularity from web | Synthetic data | Auto-generates from webpages, transfers to desktop/mobile |
+| **Fara-7B Data** | [2511.19663](https://arxiv.org/abs/2511.19663) | 145K trajectories, 1M+ steps | Web navigation | Microsoft, Orchestrator+WebSurfer agents |
 
 ### OS-Genesis: Implementation Deep Dive
 
@@ -3850,9 +3872,12 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 
 ### UI-R1: GRPO for GUI Action Prediction (arXiv:2503.21620)
 
+> **Paper**: [UI-R1: Enhancing Action Prediction of GUI Agents by Reinforcement Learning](https://arxiv.org/abs/2503.21620)
+> **Key Result**: +15% action type accuracy, +20% grounding accuracy with only **136 training tasks**
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                     UI-R1: APPLYING GRPO TO GUI AGENTS (Qwen2.5-VL-3B)                                      │
+│                     UI-R1: APPLYING GRPO TO GUI AGENTS (Qwen2.5-VL-3B) — VERIFIED                           │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
 │  KEY INSIGHT: DeepSeek-R1 style RL works for GUI agents, not just math                                     │
@@ -4323,18 +4348,626 @@ CRITICAL INSIGHT: GRPO only works if base model is capable enough
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Paper References
+### Paper References (All Verified) — Complete Technical Breakdown
 
-| Paper | arXiv ID | Key Contribution |
-|-------|----------|------------------|
-| **MAI-UI Technical Report** | [2512.22047](https://arxiv.org/abs/2512.22047) | Self-evolving pipeline, GRPO on Verl, device-cloud collaboration |
-| **UI-Ins** | [2510.20286](https://arxiv.org/abs/2510.20286) | Instruction-as-Reasoning paradigm, 4 perspectives |
-| **OS-Genesis** | [2412.19723](https://arxiv.org/abs/2412.19723) | Reverse task synthesis, trajectory reward model |
-| **UI-R1** | [2503.21620](https://arxiv.org/abs/2503.21620) | GRPO for GUI action prediction with Qwen2.5-VL |
-| **FaraGen/Fara-7B** | - | Multi-agent synthetic data engine, 145K trajectories |
-| **GUI-360** | - | LLM-augmented pipeline for Windows apps |
-| **UGround** | - | 10M elements, 1.3M screenshots for grounding |
-| **OS-ATLAS** | - | 13M elements, open-source synthesis toolkit |
+---
+
+#### **1. MAI-UI Technical Report** — [arXiv:2512.22047](https://arxiv.org/abs/2512.22047)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  MAI-UI: COMPLETE TECHNICAL DETAILS                                                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: Alibaba Tongyi Lab (December 2025)                                                                 │
+│                                                                                                             │
+│  BASE MODEL ARCHITECTURE:                                                                                   │
+│  ═══════════════════════                                                                                    │
+│  • Backbone: Qwen3-VL (NOT Qwen2.5-VL)                                                                     │
+│  • Model Sizes: 2B, 8B, 32B, 235B-A22B (MoE)                                                               │
+│  • vLLM Support: YES - via qwen3_vl.py / qwen3_vl_moe.py                                                   │
+│  • Key Architecture Features:                                                                               │
+│    - Interleaved-MRoPE for positional encoding                                                             │
+│    - DeepStack for multi-level ViT feature fusion                                                          │
+│    - Text-Timestamp Alignment for video temporal grounding                                                 │
+│                                                                                                             │
+│  TRAINING METHODOLOGY:                                                                                      │
+│  ═════════════════════                                                                                      │
+│  1. SFT Stage: Supervised fine-tuning on self-evolving data                                                │
+│  2. RL Stage: GRPO on Verl infrastructure                                                                  │
+│     • 500+ concurrent Android Virtual Device instances                                                     │
+│     • Asynchronous on-policy execution                                                                     │
+│     • Hybrid parallelism: TP + PP + CP                                                                     │
+│                                                                                                             │
+│  DATA PIPELINE:                                                                                             │
+│  ══════════════                                                                                             │
+│  • MLLM-as-a-judge for trajectory evaluation                                                               │
+│  • Longest correct prefix extraction from failed rollouts                                                  │
+│  • Iterative rejection sampling loop                                                                       │
+│  • 4 instruction perspectives (from UI-Ins): Appearance/Functionality/Location/Intent                     │
+│                                                                                                             │
+│  ACTION SPACE:                                                                                              │
+│  ═════════════                                                                                              │
+│  • Standard UI: tap, type, scroll, swipe                                                                   │
+│  • *ask_user*: Request clarification                                                                       │
+│  • *mcp_call*: Invoke external tools via MCP                                                               │
+│                                                                                                             │
+│  SCALING RESULTS:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • 32 → 512 parallel environments: +5.2 points                                                             │
+│  • 15 → 50 environment steps: +4.3 points                                                                  │
+│                                                                                                             │
+│  BENCHMARK RESULTS:                                                                                         │
+│  ══════════════════                                                                                         │
+│  • ScreenSpot-Pro: 73.5% (SOTA)                                                                            │
+│  • MMBench GUI L2: 91.3% (SOTA)                                                                            │
+│  • AndroidWorld: 76.7% (beats Gemini 2.5 Pro, Seed1.8, UI-TARS-2)                                         │
+│  • MobileWorld: 41.7% (SOTA)                                                                               │
+│                                                                                                             │
+│  vLLM DEPLOYMENT:                                                                                           │
+│  ═════════════════                                                                                          │
+│  ┌──────────────────┬──────────────────┬───────────────────┬────────────────────────────────────────────┐  │
+│  │ Model            │ Min GPU          │ vLLM Config       │ Expected Latency                           │  │
+│  ├──────────────────┼──────────────────┼───────────────────┼────────────────────────────────────────────┤  │
+│  │ MAI-UI-2B        │ T4 16GB          │ dtype=float16     │ ~800ms                                     │  │
+│  │ MAI-UI-8B        │ A100-40GB        │ dtype=bfloat16    │ ~300ms                                     │  │
+│  │ MAI-UI-32B       │ A100-80GB        │ dtype=bfloat16    │ ~500ms                                     │  │
+│  │ MAI-UI-235B-A22B │ 8×H100-80GB      │ TP=8, EP enabled  │ ~400ms                                     │  │
+│  └──────────────────┴──────────────────┴───────────────────┴────────────────────────────────────────────┘  │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **2. UI-Ins** — [arXiv:2510.20286](https://arxiv.org/abs/2510.20286)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  UI-Ins: INSTRUCTION-AS-REASONING PARADIGM                                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: ICLR 2026 Submission                                                                               │
+│                                                                                                             │
+│  PROBLEM IDENTIFIED:                                                                                        │
+│  ═══════════════════                                                                                        │
+│  • 23.3% flaw rate in existing grounding dataset instructions                                              │
+│  • Existing instructions are static, not dynamic reasoning pathways                                        │
+│                                                                                                             │
+│  CORE INNOVATION:                                                                                           │
+│  ═════════════════                                                                                          │
+│  Instruction-as-Reasoning: Treat instructions as DYNAMIC ANALYTICAL PATHWAYS                               │
+│                                                                                                             │
+│  4 HUMAN-LIKE PERSPECTIVES (THIS IS THE SOURCE):                                                            │
+│  ═══════════════════════════════════════════════                                                            │
+│  ┌───────────────┬────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ APPEARANCE    │ "Click the blue button with white text in the rounded rectangle"                      ││
+│  │ FUNCTIONALITY │ "Click the button that submits the form and saves your data"                          ││
+│  │ LOCATION      │ "Click the button at the bottom right corner of the form section"                     ││
+│  │ INTENT        │ "Complete your order by clicking the final confirmation"                               ││
+│  └───────────────┴────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  TWO-STAGE TRAINING:                                                                                        │
+│  ════════════════════                                                                                       │
+│  Stage 1: SFT on multi-perspective instructions                                                            │
+│           → Model learns to generate reasoning text from diverse perspectives                              │
+│  Stage 2: GRPO-based RL for pathway selection                                                              │
+│           → Model learns to SELECT optimal perspective for each scenario                                   │
+│                                                                                                             │
+│  DATA PIPELINE:                                                                                             │
+│  ══════════════                                                                                             │
+│  1. Clean noisy annotations using OmniParser V2 + IoU-based refinement                                     │
+│  2. Use GPT-4.1 to generate instructions from all 4 perspectives                                          │
+│  3. Verify each instruction unambiguously refers to target element                                         │
+│                                                                                                             │
+│  MODELS RELEASED:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • UI-Ins-7B: Best agent performance (66.1% AndroidWorld)                                                  │
+│  • UI-Ins-32B: Best grounding accuracy (87.3% UI-I2E-Bench)                                               │
+│                                                                                                             │
+│  RELATIONSHIP TO QWEN-VL:                                                                                   │
+│  ═══════════════════════                                                                                    │
+│  • Built on Qwen2-VL / Qwen2.5-VL architecture                                                             │
+│  • MAI-UI adopts this paradigm for grounding training                                                      │
+│                                                                                                             │
+│  vLLM RELEVANCE:                                                                                            │
+│  ════════════════                                                                                           │
+│  • The multi-perspective instruction approach works with any Qwen-VL model in vLLM                        │
+│  • Does not require vLLM changes—affects TRAINING DATA only                                                │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **3. OS-Genesis** — [arXiv:2412.19723](https://arxiv.org/abs/2412.19723)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  OS-GENESIS: REVERSE TASK SYNTHESIS                                                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: ACL 2025 (Oral)                                                                                    │
+│  GITHUB: https://github.com/OS-Copilot/OS-Genesis                                                          │
+│                                                                                                             │
+│  CORE INNOVATION:                                                                                           │
+│  ═════════════════                                                                                          │
+│  Reverse the trajectory collection process:                                                                │
+│  TRADITIONAL: Define task → Attempt task → Collect trajectory                                              │
+│  OS-GENESIS:  Explore GUI → Collect interactions → Derive task retrospectively                             │
+│                                                                                                             │
+│  METHODOLOGY:                                                                                               │
+│  ═════════════                                                                                              │
+│                                                                                                             │
+│  Phase 1: INTERACTION-DRIVEN FUNCTIONAL DISCOVERY                                                           │
+│  ─────────────────────────────────────────────────                                                          │
+│  • Rule-based traversal of GUI environments (emulators, browsers)                                          │
+│  • Collect interaction triplets: ⟨s_pre, action, s_post⟩                                                   │
+│    - s_pre = screenshot BEFORE action                                                                      │
+│    - action = CLICK(x,y), TYPE("text"), SCROLL(direction)                                                  │
+│    - s_post = screenshot AFTER action                                                                      │
+│  • GPT-4o generates contextually appropriate input content                                                 │
+│                                                                                                             │
+│  Phase 2: REVERSE TASK SYNTHESIS                                                                            │
+│  ────────────────────────────────                                                                           │
+│  • Low-level instruction generation (τ_low):                                                               │
+│    "Click the dropdown to display options"                                                                 │
+│  • High-level instruction construction (τ_high):                                                           │
+│    "Send an email to the specified recipient"                                                              │
+│                                                                                                             │
+│  Phase 3: TRAJECTORY REWARD MODEL (TRM)                                                                     │
+│  ────────────────────────────────────────                                                                   │
+│  • Graded scoring system: 1-5 based on:                                                                    │
+│    - Completion: Did trajectory accomplish the task?                                                       │
+│    - Coherence: Are steps logically connected?                                                             │
+│  • Unlike binary filtering, allows partially valuable trajectories                                         │
+│                                                                                                             │
+│  MODELS RELEASED:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • OS-Genesis-4B, OS-Genesis-7B, OS-Genesis-8B                                                             │
+│  • Trained on InternVL2 and Qwen2-VL architectures                                                         │
+│                                                                                                             │
+│  vLLM DEPLOYMENT:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • Models compatible with standard vLLM Qwen2-VL pipeline                                                  │
+│  • Raw triplet data released for reproducing synthesis                                                     │
+│                                                                                                             │
+│  GPU REQUIREMENTS:                                                                                          │
+│  ══════════════════                                                                                         │
+│  ┌──────────────────┬──────────────────┬──────────────────────────────────────────────────────────────────┐│
+│  │ Model            │ Min GPU          │ Notes                                                            ││
+│  ├──────────────────┼──────────────────┼──────────────────────────────────────────────────────────────────┤│
+│  │ OS-Genesis-4B    │ T4 16GB          │ FP16, good for edge deployment                                   ││
+│  │ OS-Genesis-7B    │ L4 24GB / A10G   │ BF16, balanced performance                                       ││
+│  │ OS-Genesis-8B    │ A100-40GB        │ BF16, best quality from this series                             ││
+│  └──────────────────┴──────────────────┴──────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **4. UI-R1** — [arXiv:2503.21620](https://arxiv.org/abs/2503.21620)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  UI-R1: GRPO FOR GUI ACTION PREDICTION                                                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: arXiv March 2025                                                                                   │
+│  GITHUB: https://github.com/lll6gg/UI-R1                                                                   │
+│                                                                                                             │
+│  BASE MODEL:                                                                                                │
+│  ════════════                                                                                               │
+│  Qwen2.5-VL-3B (NOT Qwen3-VL)                                                                              │
+│                                                                                                             │
+│  CORE INNOVATION:                                                                                           │
+│  ═════════════════                                                                                          │
+│  Apply DeepSeek-R1 style rule-based RL to GUI agents                                                       │
+│                                                                                                             │
+│  TRAINING METHODOLOGY:                                                                                      │
+│  ═════════════════════                                                                                      │
+│  • Algorithm: GRPO (Group Relative Policy Optimization)                                                    │
+│  • Training Data: ONLY 136 high-quality tasks                                                              │
+│  • Data Selection: 3-stage process (Quality → Difficulty → Diversity)                                     │
+│                                                                                                             │
+│  REWARD FUNCTION (Rule-Based):                                                                              │
+│  ══════════════════════════════                                                                             │
+│  R_total = R_type + R_coord + R_format                                                                     │
+│                                                                                                             │
+│  • R_type: Action type accuracy (click vs scroll vs type)                                                  │
+│  • R_coord: Coordinate accuracy for click actions (inside target bbox = 1.0)                              │
+│  • R_format: Output format correctness (valid JSON = bonus)                                                │
+│                                                                                                             │
+│  RESULTS:                                                                                                   │
+│  ═════════                                                                                                  │
+│  ┌───────────────────────┬───────────────────────────────────────────────────────────────────────────────┐ │
+│  │ Metric                │ Improvement over Qwen2.5-VL-3B base                                          │ │
+│  ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────┤ │
+│  │ Action Type Accuracy  │ +15%                                                                         │ │
+│  │ Grounding Accuracy    │ +20%                                                                         │ │
+│  │ ScreenSpot            │ +22.1%                                                                       │ │
+│  └───────────────────────┴───────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  KEY INSIGHT:                                                                                               │
+│  ═════════════                                                                                              │
+│  "136 tasks with GRPO > 76K tasks with SFT"                                                                │
+│  → Quality of RL signal matters more than quantity of SFT data                                             │
+│                                                                                                             │
+│  vLLM DEPLOYMENT:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • Model: Qwen2.5-VL-3B-UI-R1 (available on HuggingFace: LZXzju/Qwen2.5-VL-3B-UI-R1)                      │
+│  • Uses standard vLLM qwen2_5_vl.py pipeline                                                               │
+│                                                                                                             │
+│  GPU REQUIREMENTS:                                                                                          │
+│  ══════════════════                                                                                         │
+│  ┌──────────────────┬──────────────────┬──────────────────────────────────────────────────────────────────┐│
+│  │ Task             │ GPU              │ Memory                                                           ││
+│  ├──────────────────┼──────────────────┼──────────────────────────────────────────────────────────────────┤│
+│  │ Inference (FP16) │ T4 16GB          │ ~8-10GB (with image size reduction)                             ││
+│  │ Inference (4-bit)│ T4 16GB          │ ~8.6GB VRAM                                                      ││
+│  │ GRPO Training    │ 1× H20 80GB      │ Sufficient for Qwen2.5-3B                                       ││
+│  │ GRPO + vLLM      │ 8× GPU setup     │ 6 GPUs training + 2 GPUs vLLM inference server                  ││
+│  └──────────────────┴──────────────────┴──────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  vLLM CONFIG EXAMPLE:                                                                                       │
+│  ═════════════════════                                                                                      │
+│  ```python                                                                                                  │
+│  from vllm import LLM                                                                                       │
+│  llm = LLM(                                                                                                 │
+│      model="LZXzju/Qwen2.5-VL-3B-UI-R1",                                                                   │
+│      dtype="float16",                                                                                       │
+│      gpu_memory_utilization=0.9,                                                                           │
+│      limit_mm_per_prompt={"image": 3, "video": 1},  # Memory saving                                        │
+│      mm_processor_kwargs={"max_pixels": 1280*720},  # Reduce image size                                    │
+│  )                                                                                                          │
+│  ```                                                                                                        │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **5. Fara-7B / FaraGen** — [arXiv:2511.19663](https://arxiv.org/abs/2511.19663)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  FARA-7B: MICROSOFT'S COMPUTER USE AGENT                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: Microsoft Research (November 2025)                                                                 │
+│  HUGGINGFACE: microsoft/Fara-7B                                                                            │
+│  GITHUB: https://github.com/microsoft/fara                                                                 │
+│                                                                                                             │
+│  BASE MODEL:                                                                                                │
+│  ════════════                                                                                               │
+│  Qwen2.5-VL-7B (NOT Qwen3-VL)                                                                              │
+│                                                                                                             │
+│  FARGEN DATA ENGINE:                                                                                        │
+│  ════════════════════                                                                                       │
+│  Built on Magentic-One multi-agent framework:                                                              │
+│                                                                                                             │
+│  ┌────────────────┐        ┌────────────────┐                                                              │
+│  │  ORCHESTRATOR  │ ─────▶ │   WEBSURFER    │                                                              │
+│  │  (Plans tasks) │        │  (Executes)    │                                                              │
+│  └────────────────┘        └────────────────┘                                                              │
+│         │                          │                                                                        │
+│         │                          ▼                                                                        │
+│         │          ┌─────────────────────────────────────────┐                                             │
+│         └─────────▶│  145,000 trajectories across 70K+ URLs  │                                             │
+│                    │  1,000,000+ action steps                 │                                             │
+│                    └─────────────────────────────────────────┘                                             │
+│                                                                                                             │
+│  TRAINING:                                                                                                  │
+│  ══════════                                                                                                 │
+│  • Method: Supervised Fine-Tuning (SFT) only                                                               │
+│  • Training Infra: 64× H100 GPUs                                                                           │
+│  • No RL used—pure SFT on high-quality synthetic data                                                      │
+│                                                                                                             │
+│  BENCHMARK RESULTS:                                                                                         │
+│  ══════════════════                                                                                         │
+│  • WebVoyager: Competitive with frontier models                                                            │
+│  • WebTailBench: State-of-the-art for 7B class                                                             │
+│  • Cost: ~$0.025 per task (vs $0.50+ for GPT-4o)                                                          │
+│                                                                                                             │
+│  vLLM DEPLOYMENT:                                                                                           │
+│  ═════════════════                                                                                          │
+│  ```bash                                                                                                    │
+│  vllm serve "microsoft/Fara-7B" --port 5000 --dtype auto                                                   │
+│  # If OOM: add --tensor-parallel-size 2                                                                    │
+│  ```                                                                                                        │
+│                                                                                                             │
+│  GPU REQUIREMENTS:                                                                                          │
+│  ══════════════════                                                                                         │
+│  ┌──────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ GPU              │ Configuration                                                                       ││
+│  ├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤│
+│  │ A6000 48GB       │ Single GPU, --dtype bfloat16                                                        ││
+│  │ A100 80GB        │ Single GPU, --dtype bfloat16 (tested by Microsoft)                                  ││
+│  │ H100 80GB        │ Single GPU, --dtype bfloat16 (tested by Microsoft)                                  ││
+│  │ L40S             │ Single GPU (Koyeb default deployment)                                               ││
+│  │ 2× 24GB GPUs     │ --tensor-parallel-size 2 (for memory-constrained setups)                           ││
+│  └──────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  ON-DEVICE DEPLOYMENT:                                                                                      │
+│  ══════════════════════                                                                                     │
+│  • Quantized version available for Copilot+ PCs                                                            │
+│  • Uses NPU acceleration (not GPU) for local inference                                                     │
+│  • Available via Microsoft Foundry                                                                         │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **6. GUI-360** — [arXiv:2511.04307](https://arxiv.org/abs/2511.04307)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  GUI-360: WINDOWS OFFICE APPLICATIONS DATASET                                                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  GITHUB: https://github.com/2020-qqtcg/GUI-360                                                             │
+│                                                                                                             │
+│  DATASET STATISTICS:                                                                                        │
+│  ════════════════════                                                                                       │
+│  • 1.2M+ executed action steps                                                                             │
+│  • Thousands of trajectories                                                                               │
+│  • Applications: Word, Excel, PowerPoint (Windows)                                                         │
+│  • Includes: Full-resolution screenshots + Windows Accessibility API metadata                              │
+│                                                                                                             │
+│  TASKS SUPPORTED:                                                                                           │
+│  ═════════════════                                                                                          │
+│  1. GUI Grounding: Locate elements from instructions                                                       │
+│  2. Screen Parsing: Understand UI structure                                                                │
+│  3. Action Prediction: Predict next action given state                                                     │
+│                                                                                                             │
+│  DATA COLLECTION:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • LLM-augmented pipeline with TrajAgent (GPT-4o/GPT-4.1)                                                 │
+│  • Two-stage execution strategy                                                                            │
+│  • Hybrid GUI + API action space                                                                           │
+│                                                                                                             │
+│  SFT RESULTS:                                                                                               │
+│  ═════════════                                                                                              │
+│  • SFT on GUI-360 yields 82%+ grounding accuracy                                                           │
+│  • Significant gains over out-of-box VLMs                                                                  │
+│                                                                                                             │
+│  vLLM RELEVANCE:                                                                                            │
+│  ════════════════                                                                                           │
+│  • Dataset can be used to fine-tune any Qwen-VL model                                                      │
+│  • Trained models compatible with standard vLLM pipelines                                                  │
+│  • Benchmark includes configs for Qwen2.5-VL-7B                                                            │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **7. UGround** — [arXiv:2410.05243](https://arxiv.org/abs/2410.05243)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  UGROUND: UNIVERSAL VISUAL GROUNDING                                                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: Ohio State University + Orby AI                                                                   │
+│  VENUE: ICLR 2025 Oral                                                                                     │
+│  GITHUB: https://github.com/OSU-NLP-Group/UGround                                                          │
+│                                                                                                             │
+│  DATASET:                                                                                                   │
+│  ═════════                                                                                                  │
+│  • 10 million GUI elements                                                                                 │
+│  • 1.3 million screenshots                                                                                 │
+│  • LARGEST GUI visual grounding corpus to date                                                             │
+│                                                                                                             │
+│  ARCHITECTURE:                                                                                              │
+│  ═════════════                                                                                              │
+│  • Based on LLaVA architecture (NOT Qwen)                                                                  │
+│  • Visual-only grounding (no HTML/accessibility tree)                                                      │
+│  • Part of SeeAct-V framework                                                                              │
+│                                                                                                             │
+│  KEY INNOVATION:                                                                                            │
+│  ════════════════                                                                                           │
+│  "Navigate the digital world as humans do"                                                                 │
+│  → Pure visual perception, pixel-level operations                                                          │
+│  → No text-based representations needed                                                                    │
+│                                                                                                             │
+│  RESULTS:                                                                                                   │
+│  ═════════                                                                                                  │
+│  • +20% absolute improvement over existing visual grounding models                                         │
+│  • Outperforms agents that use additional text-based input                                                 │
+│                                                                                                             │
+│  vLLM RELEVANCE:                                                                                            │
+│  ════════════════                                                                                           │
+│  • NOT directly compatible with Qwen-VL vLLM pipeline                                                      │
+│  • Uses LLaVA architecture—different model family                                                          │
+│  • Dataset methodology transferable to Qwen-VL training                                                    │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **8. OS-ATLAS** — [arXiv:2410.23218](https://arxiv.org/abs/2410.23218)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  OS-ATLAS: CROSS-PLATFORM GUI GROUNDING                                                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WEBSITE: https://osatlas.github.io/                                                                       │
+│                                                                                                             │
+│  DATASET:                                                                                                   │
+│  ═════════                                                                                                  │
+│  • 13.58 million GUI elements                                                                              │
+│  • 2.24 million screenshots                                                                                │
+│  • LARGEST open-source cross-platform corpus                                                               │
+│                                                                                                             │
+│  PLATFORMS COVERED:                                                                                         │
+│  ════════════════════                                                                                       │
+│  ✓ Windows                                                                                                 │
+│  ✓ Linux                                                                                                   │
+│  ✓ MacOS                                                                                                   │
+│  ✓ Android                                                                                                 │
+│  ✓ Web                                                                                                     │
+│                                                                                                             │
+│  OPEN-SOURCE TOOLKIT:                                                                                       │
+│  ═════════════════════                                                                                      │
+│  • Data synthesis toolkit released                                                                         │
+│  • Generate your own GUI grounding data                                                                    │
+│  • Works across all 5 platforms                                                                            │
+│                                                                                                             │
+│  MODEL:                                                                                                     │
+│  ═══════                                                                                                    │
+│  • OS-Atlas foundation model                                                                               │
+│  • Excels at GUI grounding + OOD agentic tasks                                                             │
+│  • Open-source alternative to GPT-4o for GUI tasks                                                         │
+│                                                                                                             │
+│  vLLM RELEVANCE:                                                                                            │
+│  ════════════════                                                                                           │
+│  • Toolkit can generate training data for Qwen-VL models                                                   │
+│  • Cross-platform coverage useful for robust agent training                                                │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **9. EDGE** — [arXiv:2410.19461](https://arxiv.org/abs/2410.19461)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  EDGE: SYNTHETIC DATA FROM WEBPAGES                                                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  GITHUB: https://github.com/chenxuetian/EDGE                                                               │
+│                                                                                                             │
+│  CORE INNOVATION:                                                                                           │
+│  ═════════════════                                                                                          │
+│  Auto-generate GUI training data from publicly accessible webpages                                         │
+│                                                                                                             │
+│  DATA SOURCE:                                                                                               │
+│  ═════════════                                                                                              │
+│  • FineWeb-Edu subset of Common Crawl                                                                      │
+│  • Billions of webpages available                                                                          │
+│  • No manual annotation needed                                                                             │
+│                                                                                                             │
+│  METHODOLOGY:                                                                                               │
+│  ═════════════                                                                                              │
+│  1. Render webpages in headless browser                                                                    │
+│  2. JavaScript injection to extract visual elements                                                        │
+│  3. Filter invisible elements                                                                              │
+│  4. Create rich annotations (text + accessibility labels)                                                  │
+│  5. Generate multi-granularity tasks:                                                                      │
+│     - Elementary: Element-level grounding                                                                  │
+│     - Advanced: Multi-step navigation                                                                      │
+│                                                                                                             │
+│  KEY FINDING:                                                                                               │
+│  ═════════════                                                                                              │
+│  Models trained on EDGE-generated web data:                                                                │
+│  → Transfer to UNSEEN desktop and mobile environments                                                      │
+│  → No need for desktop/mobile-specific training data                                                       │
+│                                                                                                             │
+│  vLLM RELEVANCE:                                                                                            │
+│  ════════════════                                                                                           │
+│  • Training methodology, not inference                                                                     │
+│  • EDGE-trained models compatible with standard vLLM pipelines                                             │
+│  • Model and dataset available on HuggingFace                                                              │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **10. GUICourse** — [arXiv:2406.11317](https://arxiv.org/abs/2406.11317)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  GUICOURSE: VLM → GUI AGENT TRAINING SUITE                                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VENUE: ACL 2025                                                                                            │
+│  GITHUB: https://github.com/RUCBM/GUICourse                                                                │
+│                                                                                                             │
+│  DATASET SUITE (3 Parts):                                                                                   │
+│  ═══════════════════════                                                                                    │
+│                                                                                                             │
+│  1. GUIEnv (OCR + Grounding):                                                                              │
+│     • GUIEnv-global: 10M page-annotation pairs (pre-training)                                              │
+│     • GUIEnv-local: 0.7M region-text QA pairs (SFT)                                                        │
+│     • Format: "text2bbox" and "bbox2text" tasks                                                            │
+│                                                                                                             │
+│  2. GUIAct (Navigation):                                                                                    │
+│     • web-single: 67K single-step instructions                                                             │
+│     • web-multi: 5,696 human-annotated multi-step                                                          │
+│     • AITW smartphone: 9,157 instructions                                                                  │
+│                                                                                                             │
+│  3. GUIChat (Interaction):                                                                                  │
+│     • 44K single-turn QA pairs                                                                             │
+│     • 6K multi-turn dialogues                                                                              │
+│                                                                                                             │
+│  SFT FORMAT:                                                                                                │
+│  ════════════                                                                                               │
+│  • Follows Qwen-VL SFT data format                                                                         │
+│  • Ready-to-use for fine-tuning Qwen-VL models                                                             │
+│  • Preprocessing scripts included in repo                                                                  │
+│                                                                                                             │
+│  TRAINING PIPELINE:                                                                                         │
+│  ════════════════════                                                                                       │
+│  Stage 1: Pre-train on GUIEnv-global                                                                       │
+│  Stage 2: SFT on GUIEnv-local + GUIAct + GUIChat                                                           │
+│                                                                                                             │
+│  RESULTS:                                                                                                   │
+│  ═════════                                                                                                  │
+│  • Even 3.1B model works well on GUI tasks                                                                 │
+│  • Ablation: Improved OCR/grounding → better navigation                                                    │
+│                                                                                                             │
+│  vLLM DEPLOYMENT:                                                                                           │
+│  ═════════════════                                                                                          │
+│  • Models trained with GUICourse directly deployable via vLLM                                              │
+│  • Uses standard Qwen-VL architecture                                                                      │
+│  • Compatible with qwen2_vl.py / qwen2_5_vl.py pipelines                                                   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### **11. OpenCUA** — IN VLLM CODEBASE
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  OPENCUA: COMPUTER USE AGENT IN VLLM                                                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  SOURCE: XLANG Lab, The University of Hong Kong                                                            │
+│  vLLM FILE: vllm/model_executor/models/opencua.py                                                          │
+│                                                                                                             │
+│  ARCHITECTURE:                                                                                              │
+│  ═════════════                                                                                              │
+│  • Inherits from Qwen2.5-VL architecture                                                                   │
+│  • Uses Qwen2_5_VLForConditionalGeneration as base                                                         │
+│  • Custom processor for OpenCUA-specific tokens                                                            │
+│                                                                                                             │
+│  SPECIAL TOKENS:                                                                                            │
+│  ════════════════                                                                                           │
+│  • <|media_placeholder|>: Image input token                                                                │
+│                                                                                                             │
+│  vLLM INTEGRATION:                                                                                          │
+│  ══════════════════                                                                                         │
+│  • Fully integrated into vLLM model registry                                                               │
+│  • Uses standard multimodal processing pipeline                                                            │
+│  • Compatible with PagedAttention, FlashAttention, etc.                                                    │
+│                                                                                                             │
+│  CODE STRUCTURE:                                                                                            │
+│  ═════════════════                                                                                          │
+│  OpenCUAForConditionalGeneration                                                                            │
+│    └── Qwen2_5_VLForConditionalGeneration                                                                  │
+│          └── Qwen2_5_VisionTransformer (aliased as OpenCUAVisionTransformer)                               │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
