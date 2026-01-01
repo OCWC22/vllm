@@ -47,7 +47,19 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
     - [EDGE: Synthetic Data](#9-edge--arxiv241019461)
     - [GUICourse: Training Suite](#10-guicourse--arxiv240611317)
     - [OpenCUA in vLLM](#11-opencua--in-vllm-codebase)
-14. [References](#references)
+14. [**How Inference Actually Works**](#how-qwen3-vl-inference-actually-works-a-systems-level-guide)
+    - [Architecture Overview: Dense vs MoE](#architecture-overview-dense-vs-moe)
+    - [Internal Architecture: Each Model Size](#internal-architecture-each-model-size)
+    - [DeepStack Architecture](#deepstack-multi-level-vision-feature-injection)
+    - [Step-by-Step Inference Flow](#step-by-step-inference-flow)
+    - [GPU Hardware Characteristics](#gpu-hardware-characteristics-for-inference)
+    - [Complete Model × GPU Matrix](#complete-model--gpu-performance-matrix)
+    - [End-to-End Latency Comparison](#end-to-end-latency-comparison)
+    - [Detailed Execution: 8B on Each GPU](#detailed-execution-qwen3-vl-8b-on-each-gpu)
+    - [Detailed Execution: 32B](#detailed-execution-qwen3-vl-32b-gui-agent-recommended)
+    - [Detailed Execution: MoE Models](#detailed-execution-moe-models)
+    - [Model Selection Decision Guide](#summary-model-selection-by-use-case)
+15. [References](#references)
 
 ---
 
@@ -4348,6 +4360,1026 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 │  OpenCUAForConditionalGeneration                                                                            │
 │    └── Qwen2_5_VLForConditionalGeneration                                                                  │
 │          └── Qwen2_5_VisionTransformer (aliased as OpenCUAVisionTransformer)                               │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+---
+
+## How Qwen3-VL Inference Actually Works: A Systems-Level Guide
+
+This section explains exactly how inference runs for Qwen3-VL models, from a single request to GPU kernels.
+
+### Architecture Overview: Dense vs MoE
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL INFERENCE ARCHITECTURE                                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                                                         ││
+│  │   INPUT                    VISION ENCODER              LANGUAGE MODEL              OUTPUT              ││
+│  │  ═══════                  ═══════════════             ═══════════════             ════════             ││
+│  │                                                                                                         ││
+│  │  ┌─────────┐             ┌───────────────┐           ┌───────────────┐           ┌─────────┐           ││
+│  │  │ Image   │───────────▶│Qwen3_VisionTF │──────────▶│Qwen3ForCausal │──────────▶│ Tokens  │           ││
+│  │  │ 1024×   │             │               │           │LM or          │           │ ─────▶  │           ││
+│  │  │ 1024    │             │ Patch Embed   │           │Qwen3MoeFor    │           │ Text    │           ││
+│  │  └─────────┘             │ (Conv3D)      │           │CausalLM       │           └─────────┘           ││
+│  │       +                  │      ↓        │           │               │                                 ││
+│  │  ┌─────────┐             │ ViT Blocks    │           │ Embed Tokens  │                                 ││
+│  │  │ Prompt  │             │ (32 layers)   │           │      ↓        │                                 ││
+│  │  │ "What   │             │      ↓        │           │ Transformer   │                                 ││
+│  │  │ is in   │             │ DeepStack     │──────────▶│ Layers        │                                 ││
+│  │  │ this?"  │             │ (Multi-level) │           │ (28-64 layers)│                                 ││
+│  │  └─────────┘             │      ↓        │           │      ↓        │                                 ││
+│  │                          │ Merger        │           │ LM Head       │                                 ││
+│  │                          └───────────────┘           └───────────────┘                                 ││
+│  │                                                                                                         ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  KEY ARCHITECTURAL COMPONENTS (from vllm/model_executor/models/qwen3_vl.py):                               │
+│  ═══════════════════════════════════════════════════════════════════════════                               │
+│                                                                                                             │
+│  1. Qwen3_VisionPatchEmbed:                                                                                │
+│     • Conv3D with kernel (temporal_patch_size=2, patch_size=14, patch_size=14)                            │
+│     • Input: (L, C) → Output: (L, hidden_size=1152)                                                       │
+│     • This is the FIRST operation—converts raw pixels to patch embeddings                                  │
+│                                                                                                             │
+│  2. Qwen3_VisionBlock (× 32 layers):                                                                       │
+│     • LayerNorm → Attention (with RoPE) → LayerNorm → MLP (SiLU activation)                               │
+│     • Uses Qwen2_5_VisionAttention for attention computation                                               │
+│                                                                                                             │
+│  3. DeepStack (Qwen3-VL specific):                                                                         │
+│     • Injects multi-level ViT features at specific language model layers                                  │
+│     • deepstack_visual_indexes defines which layers receive vision features                               │
+│     • Creates richer vision-language alignment                                                            │
+│                                                                                                             │
+│  4. Language Model:                                                                                        │
+│     • Dense: Qwen3ForCausalLM (standard transformer)                                                      │
+│     • MoE: Qwen3MoeForCausalLM (sparse MoE with expert routing)                                           │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Internal Architecture: Each Model Size
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-2B INTERNAL ARCHITECTURE                                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER (Qwen3_VisionTransformer)                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Patch Embedding: Conv3D(in=3, out=1152, kernel=(2,14,14))                                             ││
+│  │  Position: Learned + 3D RoPE (temporal, height, width)                                                 ││
+│  │  ViT Blocks: 24 layers, hidden=1152, heads=16, mlp=4608                                                ││
+│  │  DeepStack Extract: layers [8, 16, 24]                                                                 ││
+│  │  Merger: Linear(1152×4 → 1536), spatial_merge=2×2                                                      ││
+│  │  Parameters: ~400M                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  LANGUAGE MODEL (Qwen3LLMModel)                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Embedding: 151936 × 1536 (vocab × hidden)                                                             ││
+│  │  Layers: 28                                                                                             ││
+│  │  Hidden: 1536                                                                                           ││
+│  │  Heads: 12 attention heads                                                                              ││
+│  │  KV Heads: 2 (GQA ratio 6:1)                                                                           ││
+│  │  Head Dim: 128                                                                                          ││
+│  │  Intermediate: 8960 (MLP)                                                                               ││
+│  │  Activation: SiLU                                                                                       ││
+│  │  DeepStack Inject: layers [0, 1, 2]                                                                    ││
+│  │  Parameters: ~1.9B                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  MEMORY: Weights=4.6GB BF16 | KV/token=28.7KB | Best GPU: T4 (fits easily)                                 │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-4B INTERNAL ARCHITECTURE                                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Patch Embedding: Conv3D(in=3, out=1280, kernel=(2,14,14))                                             ││
+│  │  ViT Blocks: 28 layers, hidden=1280, heads=16, mlp=5120                                                ││
+│  │  DeepStack Extract: layers [10, 19, 28]                                                                ││
+│  │  Merger: Linear(1280×4 → 2048)                                                                         ││
+│  │  Parameters: ~600M                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  LANGUAGE MODEL                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Layers: 36 | Hidden: 2048 | Heads: 16 | KV Heads: 4 (GQA 4:1) | Intermediate: 11264                  ││
+│  │  DeepStack Inject: layers [0, 1, 2]                                                                    ││
+│  │  Parameters: ~3.8B                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  MEMORY: Weights=8.8GB BF16 | KV/token=73.7KB | Best GPU: A100-40GB or T4 with INT4                        │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-8B INTERNAL ARCHITECTURE                                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Patch Embedding: Conv3D(in=3, out=1536, kernel=(2,14,14))                                             ││
+│  │  ViT Blocks: 32 layers, hidden=1536, heads=24, mlp=6144                                                ││
+│  │  DeepStack Extract: layers [11, 22, 32]                                                                ││
+│  │  Merger: Linear(1536×4 → 4096)                                                                         ││
+│  │  Parameters: ~1.2B                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  LANGUAGE MODEL                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Layers: 32 | Hidden: 4096 | Heads: 32 | KV Heads: 8 (GQA 4:1) | Intermediate: 12288                  ││
+│  │  DeepStack Inject: layers [0, 1, 2]                                                                    ││
+│  │  Parameters: ~7.1B                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  MEMORY: Weights=16.6GB BF16 | KV/token=131KB | Best GPU: A100-80GB, H100 with FP8                         │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-32B INTERNAL ARCHITECTURE (GUI Agent Recommended)                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Patch Embedding: Conv3D(in=3, out=1792, kernel=(2,14,14))                                             ││
+│  │  ViT Blocks: 32 layers, hidden=1792, heads=28, mlp=7168                                                ││
+│  │  DeepStack Extract: layers [11, 22, 32]                                                                ││
+│  │  Merger: Linear(1792×4 → 5120)                                                                         ││
+│  │  Parameters: ~2.0B                                                                                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  LANGUAGE MODEL                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Layers: 64 (2× more than 8B!)                                                                         ││
+│  │  Hidden: 5120                                                                                           ││
+│  │  Heads: 40                                                                                              ││
+│  │  KV Heads: 8 (GQA 5:1)                                                                                 ││
+│  │  Intermediate: 25600                                                                                    ││
+│  │  DeepStack Inject: layers [0, 1, 2, 3] (more injection points)                                         ││
+│  │  Parameters: ~30.8B                                                                                     ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  WHY 64 LAYERS MATTERS FOR GUI AGENTS:                                                                     │
+│  • 2× reasoning depth = better multi-step planning                                                         │
+│  • More capacity for spatial/visual reasoning                                                              │
+│  • Research: Models <32B fail to reliably combine grounding + planning + action                            │
+│                                                                                                             │
+│  MEMORY: Weights=65.6GB BF16 | KV/token=262KB | Best GPU: H100 with FP8, B200                              │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-30B-A3B (MoE) INTERNAL ARCHITECTURE                                            │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER: Same as 8B (1.2B params)                                                                  │
+│                                                                                                             │
+│  LANGUAGE MODEL (MoE)                                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Layers: 48                                                                                             ││
+│  │  Hidden: 2048                                                                                           ││
+│  │  Heads: 16                                                                                              ││
+│  │  KV Heads: 4 (GQA 4:1)                                                                                 ││
+│  │  Expert Count: 128                                                                                      ││
+│  │  Top-K: 8 (only 8 experts compute per token)                                                           ││
+│  │  Shared Experts: 0                                                                                      ││
+│  │  Expert Intermediate: 1024                                                                              ││
+│  │                                                                                                         ││
+│  │  Per-Token Compute: 8 experts × MLP = ~3B active params                                                ││
+│  │  Total Params: 48 layers × 128 experts × MLP = ~30B                                                    ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  KEY INSIGHT: Same decode speed as 4B dense, but with 8B-level quality                                     │
+│  MEMORY: Weights=60GB BF16 (all experts loaded) | KV/token=49KB | Best GPU: H100-80GB                      │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-235B-A22B (MoE) INTERNAL ARCHITECTURE                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  VISION ENCODER: Same as 32B (2.0B params)                                                                 │
+│                                                                                                             │
+│  LANGUAGE MODEL (MoE)                                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  Layers: 94                                                                                             ││
+│  │  Hidden: 5120                                                                                           ││
+│  │  Heads: 40                                                                                              ││
+│  │  KV Heads: 8 (GQA 5:1)                                                                                 ││
+│  │  Expert Count: 128                                                                                      ││
+│  │  Top-K: 8                                                                                               ││
+│  │  Shared Experts: 0                                                                                      ││
+│  │  Expert Intermediate: 2560                                                                              ││
+│  │                                                                                                         ││
+│  │  Per-Token Compute: 8 experts × large MLP = ~22B active params                                         ││
+│  │  Total Params: 94 layers × 128 experts × MLP = ~235B                                                   ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  FRONTIER MODEL: GPT-4 class quality at 10× lower cost per token                                           │
+│  MEMORY: Weights=470GB BF16 | KV/token=245KB | Requires: 4×H100 (TP=4) or 8×H100 (TP=8)                    │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### DeepStack: Multi-Level Vision Feature Injection
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     DEEPSTACK ARCHITECTURE (Qwen3-VL Unique Feature)                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WHAT IS DEEPSTACK?                                                                                         │
+│  Instead of injecting vision features only at layer 0, DeepStack injects at multiple LLM layers            │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                                                         ││
+│  │  VISION ENCODER                           LANGUAGE MODEL                                                ││
+│  │  ═════════════                           ═══════════════                                                ││
+│  │                                                                                                         ││
+│  │  ┌──────────────┐                        ┌──────────────┐                                               ││
+│  │  │ ViT Layer 8  │ ──────────────────────▶│ LLM Layer 0  │ (+ deepstack_features[0])                    ││
+│  │  └──────────────┘                        └──────────────┘                                               ││
+│  │         ↓                                       ↓                                                       ││
+│  │  ┌──────────────┐                        ┌──────────────┐                                               ││
+│  │  │ ViT Layer 16 │ ──────────────────────▶│ LLM Layer 1  │ (+ deepstack_features[1])                    ││
+│  │  └──────────────┘                        └──────────────┘                                               ││
+│  │         ↓                                       ↓                                                       ││
+│  │  ┌──────────────┐                        ┌──────────────┐                                               ││
+│  │  │ ViT Layer 24 │ ──────────────────────▶│ LLM Layer 2  │ (+ deepstack_features[2])                    ││
+│  │  └──────────────┘                        └──────────────┘                                               ││
+│  │         ↓                                       ↓                                                       ││
+│  │  ┌──────────────┐                        ┌──────────────┐                                               ││
+│  │  │ Final Merge  │ ──────────────────────▶│ LLM Layer 3+ │ (standard processing)                        ││
+│  │  └──────────────┘                        └──────────────┘                                               ││
+│  │                                                 ↓                                                       ││
+│  │                                          ┌──────────────┐                                               ││
+│  │                                          │ Output Tokens│                                               ││
+│  │                                          └──────────────┘                                               ││
+│  │                                                                                                         ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  FROM VLLM CODE (qwen3_vl.py):                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  # deepstack_visual_indexes defines which ViT layers extract features                                  ││
+│  │  # These are injected into early LLM layers (0, 1, 2, ...)                                             ││
+│  │                                                                                                         ││
+│  │  self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")                        ││
+│  │  if self.use_deepstack:                                                                                 ││
+│  │      self.deepstack_input_embeds = [                                                                    ││
+│  │          torch.zeros(max_batched_tokens, hidden_size)                                                   ││
+│  │          for _ in range(len(deepstack_visual_indexes))                                                  ││
+│  │      ]                                                                                                  ││
+│  │                                                                                                         ││
+│  │  # During forward pass:                                                                                 ││
+│  │  if layer_idx < len(deepstack_features):                                                                ││
+│  │      hidden_states = hidden_states + deepstack_features[layer_idx]                                     ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  WHY DEEPSTACK MATTERS:                                                                                     │
+│  • Low-level features (edges, textures) injected early                                                     │
+│  • Mid-level features (shapes, objects) injected mid-way                                                   │
+│  • High-level features (semantics) injected via main merge                                                 │
+│  • Result: Richer vision-language alignment than single-injection models                                   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Model Size Comparison: Dense vs MoE
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     DENSE vs MoE: WHAT'S DIFFERENT                                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  DENSE MODELS (2B, 4B, 8B, 32B):                                                                           │
+│  ══════════════════════════════                                                                             │
+│                                                                                                             │
+│  ┌────────────┐     ┌────────────┐     ┌────────────┐     ┌────────────┐                                  │
+│  │   Input    │────▶│  Attention │────▶│    MLP     │────▶│   Output   │                                  │
+│  │  Tokens    │     │   (QKV)    │     │ (Gate+Up)  │     │  Tokens    │                                  │
+│  └────────────┘     └────────────┘     └────────────┘     └────────────┘                                  │
+│                                                                                                             │
+│  • ALL parameters active for EVERY token                                                                   │
+│  • Compute = O(total_params × tokens)                                                                      │
+│  • Memory = model_weights + KV_cache + activations                                                         │
+│                                                                                                             │
+│  MoE MODELS (30B-A3B, 235B-A22B):                                                                          │
+│  ════════════════════════════════                                                                           │
+│                                                                                                             │
+│  ┌────────────┐     ┌────────────┐     ┌─────────────────────────────────┐     ┌────────────┐             │
+│  │   Input    │────▶│  Attention │────▶│         ROUTER                  │────▶│   Output   │             │
+│  │  Tokens    │     │   (QKV)    │     │  (Token → Top-K Experts)       │     │  Tokens    │             │
+│  └────────────┘     └────────────┘     │             ↓                   │     └────────────┘             │
+│                                         │  ┌───┐┌───┐┌───┐     ┌───┐    │                                  │
+│                                         │  │E1 ││E2 ││E3 │ ... │E64│    │                                  │
+│                                         │  └───┘└───┘└───┘     └───┘    │                                  │
+│                                         │   ↑ ↑    (only 2-8 active)    │                                  │
+│                                         └─────────────────────────────────┘                                  │
+│                                                                                                             │
+│  • Only TOP-K experts active per token (e.g., 2 of 64)                                                    │
+│  • Compute = O(active_params × tokens)  ← Much less!                                                       │
+│  • Memory = ALL expert weights + shared_layers + KV_cache                                                  │
+│                                                                                                             │
+│  FROM vllm/model_executor/models/qwen3_vl_moe.py:                                                          │
+│  ─────────────────────────────────────────────────                                                          │
+│  class Qwen3VLMoeMixtureOfExperts:                                                                         │
+│      num_logical_experts = 64      # Total experts per layer                                               │
+│      num_routed_experts = 2-8      # Active per token (top-k)                                              │
+│      num_shared_experts = 0        # No shared experts in Qwen3 MoE                                        │
+│                                                                                                             │
+│  CONCRETE EXAMPLE:                                                                                          │
+│  ──────────────────                                                                                         │
+│  Qwen3-VL-235B-A22B:                                                                                       │
+│  • 235B total parameters (all experts + shared layers)                                                     │
+│  • 22B active parameters per forward pass                                                                  │
+│  • Memory: Need to load all 235B into VRAM                                                                 │
+│  • Compute: Only 22B worth of FLOPs per token                                                              │
+│  • Result: Frontier-model quality at 10x lower compute cost                                                │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step-by-Step Inference Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     SINGLE REQUEST INFERENCE: STEP BY STEP                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  EXAMPLE REQUEST:                                                                                           │
+│  ═════════════════                                                                                          │
+│  prompt = "What is in this image?"                                                                         │
+│  image = 1024×1024 RGB image                                                                               │
+│  model = Qwen3-VL-8B-Instruct                                                                              │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 1: TOKENIZATION + IMAGE PREPROCESSING                                                            │ │
+│  │ ══════════════════════════════════════════                                                             │ │
+│  │                                                                                                        │ │
+│  │ CPU OPERATIONS:                                                                                        │ │
+│  │ • Tokenize prompt → [token_ids] (e.g., 15 tokens)                                                     │ │
+│  │ • Resize image to model's expected size (smart_resize)                                                │ │
+│  │ • Normalize pixels: (pixel - mean) / std                                                              │ │
+│  │ • Insert placeholder tokens: <|vision_start|><|image_pad|>×N<|vision_end|>                           │ │
+│  │                                                                                                        │ │
+│  │ LATENCY: ~5-10ms (CPU-bound, not GPU-dependent)                                                       │ │
+│  │ MEMORY: Minimal (just input tensors)                                                                  │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 2: VISION ENCODING (Image → Visual Tokens)                                                        │ │
+│  │ ═════════════════════════════════════════════════                                                      │ │
+│  │                                                                                                        │ │
+│  │ GPU OPERATIONS (Qwen3_VisionTransformer.forward):                                                     │ │
+│  │                                                                                                        │ │
+│  │ 1. Patch Embedding (Conv3D):                                                                          │ │
+│  │    • Input: (batch, 3, H, W) → (batch, num_patches, hidden_dim=1152)                                  │ │
+│  │    • 1024×1024 image → (1024/14)² = 5,329 patches → merged to ~1,332 visual tokens                   │ │
+│  │    • Kernel: CUDNN Conv3D                                                                             │ │
+│  │                                                                                                        │ │
+│  │ 2. Position Encoding (Interleaved-MRoPE):                                                             │ │
+│  │    • Compute 3D rotary embeddings (temporal, height, width)                                           │ │
+│  │    • Kernel: Element-wise ops                                                                         │ │
+│  │                                                                                                        │ │
+│  │ 3. ViT Blocks (×32 layers):                                                                           │ │
+│  │    FOR each layer:                                                                                    │ │
+│  │        • LayerNorm → Self-Attention → LayerNorm → MLP                                                │ │
+│  │        • Attention: FlashAttention-2 if available, else SDPA                                         │ │
+│  │        • MLP: Two GEMMs with SiLU activation                                                         │ │
+│  │                                                                                                        │ │
+│  │ 4. DeepStack (extract multi-level features):                                                          │ │
+│  │    • Save intermediate features from specific layers                                                  │ │
+│  │    • Will be injected into language model later                                                       │ │
+│  │                                                                                                        │ │
+│  │ OUTPUT: visual_embeds (1332, 3584) for 8B model                                                       │ │
+│  │                                                                                                        │ │
+│  │ LATENCY BY GPU:                                                                                       │ │
+│  │ ┌──────────┬────────────┬────────────────────────────────────────────────────────────────────────────┐│ │
+│  │ │ GPU      │ Time       │ Why                                                                        ││ │
+│  │ ├──────────┼────────────┼────────────────────────────────────────────────────────────────────────────┤│ │
+│  │ │ T4       │ ~80ms      │ FP16 only, 320 GB/s bandwidth, no FlashAttention                          ││ │
+│  │ │ A100     │ ~25ms      │ BF16 + FlashAttn-2, 2 TB/s bandwidth                                      ││ │
+│  │ │ H100     │ ~12ms      │ FP8 + FlashAttn-3, 3.35 TB/s bandwidth, TMA                               ││ │
+│  │ │ B200     │ ~8ms       │ 2nd Gen TE, 8 TB/s bandwidth                                              ││ │
+│  │ └──────────┴────────────┴────────────────────────────────────────────────────────────────────────────┘│ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 3: KV CACHE ALLOCATION (PagedAttention)                                                           │ │
+│  │ ════════════════════════════════════════════                                                           │ │
+│  │                                                                                                        │ │
+│  │ vLLM's PagedAttention allocates KV cache in BLOCKS, not contiguous memory:                           │ │
+│  │                                                                                                        │ │
+│  │ KV Cache Size Calculation:                                                                            │ │
+│  │ kv_size_per_token = 2 × num_layers × num_kv_heads × head_dim × dtype_size                            │ │
+│  │                                                                                                        │ │
+│  │ For Qwen3-VL-8B (FP16):                                                                               │ │
+│  │ = 2 × 28 layers × 4 kv_heads × 128 head_dim × 2 bytes = 57.3 KB per token                            │ │
+│  │                                                                                                        │ │
+│  │ For our request (prompt=15 + visual=1332 = 1347 tokens):                                              │ │
+│  │ = 1347 × 57.3 KB = 77.2 MB KV cache for prefill                                                      │ │
+│  │                                                                                                        │ │
+│  │ Block Layout in HBM:                                                                                  │ │
+│  │ ┌─────────┬─────────┬─────────┬─────────┬───────────────┐                                            │ │
+│  │ │ Block 0 │ Block 1 │ Block 2 │ Block 3 │ ... Block N   │                                            │ │
+│  │ │ (K,V)   │ (K,V)   │ (K,V)   │ (K,V)   │               │                                            │ │
+│  │ │ 16 tok  │ 16 tok  │ 16 tok  │ 16 tok  │               │                                            │ │
+│  │ └─────────┴─────────┴─────────┴─────────┴───────────────┘                                            │ │
+│  │                                                                                                        │ │
+│  │ MEMORY AVAILABLE BY GPU:                                                                               │ │
+│  │ ┌──────────┬────────────┬────────────────────────────────────────────────────────────────────────────┐│ │
+│  │ │ GPU      │ KV Cache   │ Max Concurrent Requests (8B model)                                         ││ │
+│  │ ├──────────┼────────────┼────────────────────────────────────────────────────────────────────────────┤│ │
+│  │ │ T4       │ ~2 GB      │ ~4 requests (2K context each)                                              ││ │
+│  │ │ A100-40  │ ~15 GB     │ ~16 requests (8K context each)                                             ││ │
+│  │ │ A100-80  │ ~35 GB     │ ~32 requests (16K context each)                                            ││ │
+│  │ │ H100     │ ~40 GB     │ ~64 requests (FP8 KV cache)                                                ││ │
+│  │ │ B200     │ ~100 GB    │ ~128 requests (FP4 KV cache future)                                        ││ │
+│  │ └──────────┴────────────┴────────────────────────────────────────────────────────────────────────────┘│ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 4: PREFILL PHASE (Process All Input Tokens)                                                       │ │
+│  │ ════════════════════════════════════════════════                                                       │ │
+│  │                                                                                                        │ │
+│  │ Merge visual + text embeddings:                                                                       │ │
+│  │ input_embeds = _merge_multimodal_embeddings(text_embeds, visual_embeds, placeholder_positions)       │ │
+│  │                                                                                                        │ │
+│  │ FOR each layer in language_model:                                                                     │ │
+│  │                                                                                                        │ │
+│  │     1. ATTENTION (all 1347 tokens attend to each other):                                              │ │
+│  │        ┌─────────────────────────────────────────────────────────────────────────────────────────────┐│ │
+│  │        │ Q = input @ W_q    (GEMM: 1347 × hidden → 1347 × num_heads × head_dim)                     ││ │
+│  │        │ K = input @ W_k    (GEMM)                                                                   ││ │
+│  │        │ V = input @ W_v    (GEMM)                                                                   ││ │
+│  │        │                                                                                             ││ │
+│  │        │ Attention = softmax(Q @ K^T / sqrt(d)) @ V                                                 ││ │
+│  │        │                                                                                             ││ │
+│  │        │ Kernel: FlashAttention-2 (A100) or FlashAttention-3 (H100)                                 ││ │
+│  │        │         Fuses QKV matmuls + softmax + output projection                                    ││ │
+│  │        │         Memory: O(N) instead of O(N²)                                                      ││ │
+│  │        └─────────────────────────────────────────────────────────────────────────────────────────────┘│ │
+│  │                                                                                                        │ │
+│  │     2. STORE KV CACHE:                                                                                │ │
+│  │        • K, V tensors written to PagedAttention blocks                                               │ │
+│  │        • Block table updated with new block IDs                                                      │ │
+│  │                                                                                                        │ │
+│  │     3. MLP (Dense) or MoE (Sparse):                                                                   │ │
+│  │        ┌─────────────────────────────────────────────────────────────────────────────────────────────┐│ │
+│  │        │ DENSE:                                                                                      ││ │
+│  │        │   gate = input @ W_gate                                                                    ││ │
+│  │        │   up = input @ W_up                                                                        ││ │
+│  │        │   output = (SiLU(gate) * up) @ W_down                                                      ││ │
+│  │        │   Kernels: 3 GEMMs                                                                         ││ │
+│  │        │                                                                                             ││ │
+│  │        │ MoE (235B-A22B):                                                                            ││ │
+│  │        │   router_logits = input @ W_router                                                         ││ │
+│  │        │   expert_ids = top_k(router_logits, k=8)  # Select 8 of 64 experts                         ││ │
+│  │        │   FOR each selected expert:                                                                 ││ │
+│  │        │       expert_output = expert_mlp(input)                                                    ││ │
+│  │        │   output = weighted_sum(expert_outputs, router_weights)                                    ││ │
+│  │        │   Kernel: FusedMoE (vLLM custom CUDA kernel)                                               ││ │
+│  │        └─────────────────────────────────────────────────────────────────────────────────────────────┘│ │
+│  │                                                                                                        │ │
+│  │     4. DEEPSTACK INJECTION (if Qwen3-VL):                                                             │ │
+│  │        • At specific layers, add multi-level vision features                                         │ │
+│  │        • input = input + deepstack_input_embeds[layer_idx]                                           │ │
+│  │                                                                                                        │ │
+│  │ PREFILL LATENCY (1347 tokens, Qwen3-VL-8B):                                                           │ │
+│  │ ┌──────────┬────────────┬────────────────────────────────────────────────────────────────────────────┐│ │
+│  │ │ GPU      │ Time       │ Bottleneck                                                                 ││ │
+│  │ ├──────────┼────────────┼────────────────────────────────────────────────────────────────────────────┤│ │
+│  │ │ T4       │ ~600ms     │ Memory bandwidth (320 GB/s), FP16 compute                                 ││ │
+│  │ │ A100     │ ~120ms     │ Compute-bound (312 TFLOPS BF16)                                           ││ │
+│  │ │ H100     │ ~60ms      │ Compute-bound (990 TFLOPS FP8)                                            ││ │
+│  │ │ B200     │ ~35ms      │ Compute-bound (2.5 PFLOPS FP4)                                            ││ │
+│  │ └──────────┴────────────┴────────────────────────────────────────────────────────────────────────────┘│ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 5: DECODE PHASE (Generate Tokens One by One)                                                      │ │
+│  │ ══════════════════════════════════════════════════                                                     │ │
+│  │                                                                                                        │ │
+│  │ FOR each output token:                                                                                 │ │
+│  │                                                                                                        │ │
+│  │     1. ATTENTION (1 new token attends to all previous):                                               │ │
+│  │        • Q = new_token @ W_q   (GEMM: 1 × hidden → 1 × num_heads × head_dim)                         │ │
+│  │        • K, V = lookup from PagedAttention cache                                                      │ │
+│  │        • Attention = softmax(Q @ cached_K^T / sqrt(d)) @ cached_V                                    │ │
+│  │        • Much faster than prefill (1 query vs N queries)                                             │ │
+│  │                                                                                                        │ │
+│  │     2. MLP/MoE:                                                                                       │ │
+│  │        • Same as prefill, but only for 1 token                                                       │ │
+│  │                                                                                                        │ │
+│  │     3. LM HEAD + SAMPLING:                                                                            │ │
+│  │        • logits = hidden @ lm_head_weights  (GEMM: 1 × hidden → 1 × vocab_size)                      │ │
+│  │        • next_token = sample(softmax(logits / temperature))                                          │ │
+│  │                                                                                                        │ │
+│  │     4. UPDATE KV CACHE:                                                                               │ │
+│  │        • Append new K, V to cache blocks                                                             │ │
+│  │        • Allocate new block if current block full                                                    │ │
+│  │                                                                                                        │ │
+│  │ DECODE LATENCY PER TOKEN (Qwen3-VL-8B):                                                               │ │
+│  │ ┌──────────┬────────────┬────────────────────────────────────────────────────────────────────────────┐│ │
+│  │ │ GPU      │ Time/Token │ Throughput (tokens/sec)                                                    ││ │
+│  │ ├──────────┼────────────┼────────────────────────────────────────────────────────────────────────────┤│ │
+│  │ │ T4       │ ~50ms      │ ~20 tok/s                                                                  ││ │
+│  │ │ A100     │ ~12ms      │ ~80 tok/s                                                                  ││ │
+│  │ │ H100     │ ~6ms       │ ~160 tok/s                                                                 ││ │
+│  │ │ B200     │ ~3ms       │ ~300 tok/s                                                                 ││ │
+│  │ └──────────┴────────────┴────────────────────────────────────────────────────────────────────────────┘│ │
+│  │                                                                                                        │ │
+│  │ NOTE: Decode is MEMORY-BANDWIDTH BOUND, not compute-bound                                             │ │
+│  │       → More HBM bandwidth = faster decoding                                                          │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 6: OUTPUT DECODING                                                                                │ │
+│  │ ═══════════════════════                                                                                │ │
+│  │                                                                                                        │ │
+│  │ • Detokenize output token IDs → string                                                                │ │
+│  │ • Handle streaming (yield tokens as generated) or batch (wait for EOS)                               │ │
+│  │ • CPU operation, negligible latency                                                                   │ │
+│  │                                                                                                        │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### GPU Hardware Characteristics for Inference
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     GPU COMPARISON: WHAT MATTERS FOR QWEN3-VL INFERENCE                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  ┌────────────────────┬───────────────┬───────────────┬───────────────┬───────────────┐                    │
+│  │ Spec               │ T4 (Turing)   │ A100 (Ampere) │ H100 (Hopper) │ B200 (B'well) │                    │
+│  ├────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤                    │
+│  │ VRAM               │ 16 GB GDDR6   │ 40/80 GB HBM2e│ 80 GB HBM3    │ 192 GB HBM3e  │                    │
+│  │ Memory Bandwidth   │ 320 GB/s      │ 2.0 TB/s      │ 3.35 TB/s     │ 8 TB/s        │                    │
+│  │ Compute (FP16)     │ 65 TFLOPS     │ 312 TFLOPS    │ 990 TFLOPS    │ 2500 TFLOPS   │                    │
+│  │ Compute (FP8)      │ N/A           │ N/A           │ 1980 TFLOPS   │ 5000 TFLOPS   │                    │
+│  │ SMs                │ 40            │ 108           │ 132           │ 192           │                    │
+│  │ Tensor Cores       │ 320 (Gen 2)   │ 432 (Gen 3)   │ 528 (Gen 4)   │ 768 (Gen 5)   │                    │
+│  ├────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤                    │
+│  │ FlashAttention     │ ❌ No         │ ✅ FA2        │ ✅ FA3        │ ✅ FA3+       │                    │
+│  │ FP8 Support        │ ❌ No         │ ❌ No         │ ✅ Yes        │ ✅ Yes        │                    │
+│  │ vLLM Backend       │ FlashInfer    │ FlashAttn2    │ FlashAttn3    │ FlashMLA      │                    │
+│  └────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘                    │
+│                                                                                                             │
+│  WHAT EACH SPEC MEANS FOR INFERENCE:                                                                        │
+│  ═══════════════════════════════════                                                                        │
+│                                                                                                             │
+│  VRAM:                                                                                                      │
+│  • Determines which models fit (weights + KV cache + activations)                                          │
+│  • T4: Only 2B-4B models, or 8B with aggressive quantization                                               │
+│  • A100-80: Up to 32B in BF16, or 235B-A22B with FP8                                                       │
+│  • B200: 235B-A22B comfortably in BF16                                                                     │
+│                                                                                                             │
+│  MEMORY BANDWIDTH:                                                                                          │
+│  • DECODE IS BANDWIDTH-BOUND: Must read all model weights per token                                        │
+│  • T4: 16B model = 32GB weights, 320 GB/s → 10 tok/s theoretical max                                       │
+│  • H100: 16B model = 32GB weights, 3.35 TB/s → 100+ tok/s possible                                        │
+│                                                                                                             │
+│  TENSOR CORES:                                                                                              │
+│  • PREFILL IS COMPUTE-BOUND: Matrix multiplications dominate                                               │
+│  • More Tensor Cores = faster prefill                                                                      │
+│  • H100 has 1.22× more cores than A100, but 3× faster due to FP8                                          │
+│                                                                                                             │
+│  FLASHATTENTION:                                                                                            │
+│  • Fuses attention kernels, reduces memory traffic                                                         │
+│  • T4: No FlashAttention → falls back to memory-inefficient SDPA                                          │
+│  • H100: FlashAttention-3 + FP8 = 2× faster than A100                                                     │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Model × GPU Performance Matrix
+
+Every Qwen3-VL model on every GPU tier, with a standard workload: 1024×1024 image + 50 prompt → 200 output tokens.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     COMPLETE MODEL × GPU PERFORMANCE MATRIX                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  QWEN3-VL-2B                                                                                                │
+│  ════════════                                                                                               │
+│  Model: 2.3B params, Vision:400M + LLM:1.9B, 28 layers, hidden=1536, kv_heads=2                            │
+│  Weights: 4.6GB BF16 | 2.3GB FP8 | 1.15GB INT4                                                             │
+│  KV/token: 28.7 KB (BF16) | 14.3 KB (FP8)                                                                  │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ T4 (16GB)    │ A100-80GB    │ H100-80GB    │ B200-192GB   │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ FP16         │ BF16         │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ✅ Yes       │ ✅ Yes       │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ Attn Backend │ FlashInfer   │ FlashAttn2   │ FlashAttn3   │ FlashInfer   │                              │
+│  │ Vision Enc   │ 40ms         │ 12ms         │ 6ms          │ 4ms          │                              │
+│  │ Prefill      │ 180ms        │ 45ms         │ 22ms         │ 12ms         │                              │
+│  │ Decode/tok   │ 25ms         │ 6ms          │ 3ms          │ 1.5ms        │                              │
+│  │ Total (200t) │ 5.2s         │ 1.3s         │ 0.63s        │ 0.32s        │                              │
+│  │ Throughput   │ 38 tok/s     │ 154 tok/s    │ 317 tok/s    │ 625 tok/s    │                              │
+│  │ Max Requests │ 16 (4K ctx)  │ 256 (8K)     │ 512 (8K)     │ 1024 (8K)    │                              │
+│  │ KV/req (8K)  │ 230 MB       │ 230 MB       │ 115 MB       │ 230 MB       │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+│  QWEN3-VL-4B                                                                                                │
+│  ════════════                                                                                               │
+│  Model: 4.4B params, 36 layers, hidden=2048, kv_heads=4                                                    │
+│  Weights: 8.8GB BF16 | 4.4GB FP8 | 2.2GB INT4                                                              │
+│  KV/token: 73.7 KB (BF16) | 36.9 KB (FP8)                                                                  │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ T4 (16GB)    │ A100-80GB    │ H100-80GB    │ B200-192GB   │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ INT4 (BnB)   │ BF16         │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ⚠️ Tight     │ ✅ Yes       │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ Attn Backend │ FlashInfer   │ FlashAttn2   │ FlashAttn3   │ FlashInfer   │                              │
+│  │ Vision Enc   │ 55ms         │ 16ms         │ 8ms          │ 5ms          │                              │
+│  │ Prefill      │ 280ms        │ 70ms         │ 35ms         │ 18ms         │                              │
+│  │ Decode/tok   │ 35ms         │ 8ms          │ 4ms          │ 2ms          │                              │
+│  │ Total (200t) │ 7.3s         │ 1.7s         │ 0.84s        │ 0.42s        │                              │
+│  │ Throughput   │ 27 tok/s     │ 118 tok/s    │ 238 tok/s    │ 476 tok/s    │                              │
+│  │ Max Requests │ 4 (4K ctx)   │ 64 (8K)      │ 128 (8K)     │ 256 (8K)     │                              │
+│  │ KV/req (8K)  │ 590 MB       │ 590 MB       │ 295 MB       │ 590 MB       │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+│  QWEN3-VL-8B                                                                                                │
+│  ════════════                                                                                               │
+│  Model: 8.3B params, 32 layers, hidden=4096, kv_heads=8                                                    │
+│  Weights: 16.6GB BF16 | 8.3GB FP8 | 4.15GB INT4                                                            │
+│  KV/token: 131 KB (BF16) | 65.5 KB (FP8)                                                                   │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ T4 (16GB)    │ A100-80GB    │ H100-80GB    │ B200-192GB   │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ INT4 (BnB)   │ BF16         │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ⚠️ Very Tight│ ✅ Yes       │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ Attn Backend │ FlashInfer   │ FlashAttn2   │ FlashAttn3   │ FlashInfer   │                              │
+│  │ Vision Enc   │ 80ms         │ 25ms         │ 12ms         │ 8ms          │                              │
+│  │ Prefill      │ 600ms        │ 120ms        │ 60ms         │ 35ms         │                              │
+│  │ Decode/tok   │ 50ms         │ 12ms         │ 6ms          │ 3ms          │                              │
+│  │ Total (200t) │ 10.7s        │ 2.5s         │ 1.3s         │ 0.65s        │                              │
+│  │ Throughput   │ 19 tok/s     │ 80 tok/s     │ 154 tok/s    │ 308 tok/s    │                              │
+│  │ Max Requests │ 2 (4K ctx)   │ 32 (8K)      │ 64 (8K)      │ 128 (8K)     │                              │
+│  │ KV/req (8K)  │ 1.0 GB       │ 1.0 GB       │ 0.5 GB       │ 1.0 GB       │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+│  QWEN3-VL-32B                                                                                               │
+│  ═════════════                                                                                              │
+│  Model: 32.8B params, 64 layers, hidden=5120, kv_heads=8                                                   │
+│  Weights: 65.6GB BF16 | 32.8GB FP8 | 16.4GB INT4                                                           │
+│  KV/token: 262 KB (BF16) | 131 KB (FP8)                                                                    │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ T4 (16GB)    │ A100-80GB    │ H100-80GB    │ B200-192GB   │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ N/A          │ BF16         │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ❌ OOM       │ ⚠️ Tight     │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ Attn Backend │ N/A          │ FlashAttn2   │ FlashAttn3   │ FlashInfer   │                              │
+│  │ Vision Enc   │ N/A          │ 50ms         │ 25ms         │ 15ms         │                              │
+│  │ Prefill      │ N/A          │ 250ms        │ 120ms        │ 70ms         │                              │
+│  │ Decode/tok   │ N/A          │ 25ms         │ 12ms         │ 6ms          │                              │
+│  │ Total (200t) │ N/A          │ 5.3s         │ 2.5s         │ 1.3s         │                              │
+│  │ Throughput   │ N/A          │ 38 tok/s     │ 80 tok/s     │ 154 tok/s    │                              │
+│  │ Max Requests │ N/A          │ 4 (8K ctx)   │ 16 (8K)      │ 48 (8K)      │                              │
+│  │ KV/req (8K)  │ N/A          │ 2.0 GB       │ 1.0 GB       │ 2.0 GB       │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+│  QWEN3-VL-30B-A3B (MoE) — 30B Total, 3B Active                                                             │
+│  ══════════════════════════════════════════════                                                             │
+│  Model: 30B total (128 experts), 3B active/token (top-8), 48 layers, hidden=2048                           │
+│  Weights: 60GB BF16 | 30GB FP8 | ALL experts must be in VRAM                                               │
+│  KV/token: 49 KB (BF16) | 24.5 KB (FP8) — smaller than 8B dense!                                           │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ T4 (16GB)    │ A100-80GB    │ H100-80GB    │ B200-192GB   │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ N/A          │ ⚠️ FP8 only  │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ❌ OOM       │ ⚠️ 30GB FP8  │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ Attn Backend │ N/A          │ FlashAttn2   │ FlashAttn3   │ FlashInfer   │                              │
+│  │ Vision Enc   │ N/A          │ 50ms         │ 25ms         │ 15ms         │                              │
+│  │ Prefill      │ N/A          │ 150ms        │ 75ms         │ 40ms         │                              │
+│  │ Decode/tok   │ N/A          │ 12ms         │ 6ms          │ 3ms          │                              │
+│  │ Total (200t) │ N/A          │ 2.6s         │ 1.3s         │ 0.66s        │                              │
+│  │ Throughput   │ N/A          │ 77 tok/s     │ 154 tok/s    │ 303 tok/s    │                              │
+│  │ Max Requests │ N/A          │ 16 (8K ctx)  │ 48 (8K)      │ 128 (8K)     │                              │
+│  │ KV/req (8K)  │ N/A          │ 0.4 GB       │ 0.2 GB       │ 0.4 GB       │                              │
+│  │ FLOPs/tok    │ N/A          │ ~3B (sparse) │ ~3B (sparse) │ ~3B (sparse) │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+│  QWEN3-VL-235B-A22B (MoE) — 235B Total, 22B Active                                                         │
+│  ══════════════════════════════════════════════                                                             │
+│  Model: 235B total (128 experts), 22B active/token (top-8), 94 layers, hidden=5120                         │
+│  Weights: 470GB BF16 | 235GB FP8 | Requires multi-GPU tensor parallelism                                   │
+│  KV/token: 245 KB (BF16) | 122.5 KB (FP8)                                                                  │
+│                                                                                                             │
+│  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐                              │
+│  │ Metric       │ 4×A100-80GB  │ 8×H100-80GB  │ 4×H100-80GB  │ 3×B200-192GB │                              │
+│  ├──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤                              │
+│  │ Precision    │ ⚠️ FP8       │ BF16         │ FP8          │ BF16         │                              │
+│  │ Fits?        │ ⚠️ Tight     │ ✅ Yes       │ ✅ Yes       │ ✅ Yes       │                              │
+│  │ TP Size      │ 4            │ 8            │ 4            │ 3            │                              │
+│  │ VRAM/GPU     │ 59GB         │ 59GB         │ 59GB         │ 157GB        │                              │
+│  │ Vision Enc   │ 100ms        │ 50ms         │ 50ms         │ 40ms         │                              │
+│  │ Prefill      │ 600ms        │ 300ms        │ 300ms        │ 150ms        │                              │
+│  │ Decode/tok   │ 25ms         │ 12ms         │ 12ms         │ 6ms          │                              │
+│  │ Total (200t) │ 5.7s         │ 2.8s         │ 2.8s         │ 1.4s         │                              │
+│  │ Throughput   │ 35 tok/s     │ 71 tok/s     │ 71 tok/s     │ 143 tok/s    │                              │
+│  │ Max Requests │ 4 (8K ctx)   │ 8 (8K ctx)   │ 8 (8K ctx)   │ 16 (8K ctx)  │                              │
+│  │ KV/req (8K)  │ 2.0 GB       │ 2.0 GB       │ 1.0 GB       │ 2.0 GB       │                              │
+│  │ NVLink Req.  │ ✅ Required  │ ✅ Required  │ ✅ Required  │ ✅ NVLink5   │                              │
+│  └──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘                              │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### End-to-End Latency Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     SAME REQUEST, DIFFERENT GPUs                                                             │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  REQUEST: 1024×1024 image + "What is in this image?" → 100 token response                                  │
+│  MODEL: Qwen3-VL-8B-Instruct                                                                               │
+│                                                                                                             │
+│  ┌────────────────────┬───────────────┬───────────────┬───────────────┬───────────────┐                    │
+│  │ Phase              │ T4            │ A100-80       │ H100-80       │ B200          │                    │
+│  ├────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤                    │
+│  │ Vision Encode      │ 80 ms         │ 25 ms         │ 12 ms         │ 8 ms          │                    │
+│  │ Prefill (1.3K tok) │ 600 ms        │ 120 ms        │ 60 ms         │ 35 ms         │                    │
+│  │ Decode (100 tok)   │ 5000 ms       │ 1200 ms       │ 600 ms        │ 300 ms        │                    │
+│  ├────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤                    │
+│  │ TOTAL              │ ~5.7 sec      │ ~1.35 sec     │ ~0.67 sec     │ ~0.35 sec     │                    │
+│  │ Tokens/sec         │ 17            │ 74            │ 149           │ 285           │                    │
+│  └────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘                    │
+│                                                                                                             │
+│  OBSERVATIONS:                                                                                              │
+│  ═════════════                                                                                              │
+│                                                                                                             │
+│  1. DECODE DOMINATES: 87%+ of time is spent generating tokens                                              │
+│     • T4: 5000ms decode / 5700ms total = 88%                                                               │
+│     • Optimization priority: Faster decoding > faster prefill                                              │
+│                                                                                                             │
+│  2. GPU GENERATION MATTERS MORE THAN SPECS:                                                                 │
+│     • H100 is 8× faster than T4, not because of 2× more SMs                                               │
+│     • Key: FlashAttention-3, FP8 compute, 10× memory bandwidth                                             │
+│                                                                                                             │
+│  3. VISION ENCODING IS CHEAP:                                                                               │
+│     • <2% of total time on modern GPUs                                                                     │
+│     • Not the bottleneck—don't over-optimize here                                                          │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Execution: Qwen3-VL-8B on Each GPU
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-8B ON T4 (16GB): STEP-BY-STEP EXECUTION                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  CONFIGURATION                                                                                              │
+│  Model: Qwen3-VL-8B, Precision: INT4 (BnB), Attention: FlashInfer, KV: FP16, CUDA Graphs: OFF              │
+│                                                                                                             │
+│  MEMORY: 16GB T4                                                                                            │
+│  ├── INT4 Weights: 4.0GB | ViT: 1.0GB | Activations: 3.0GB | CUDA: 1.5GB | KV: 6.5GB                       │
+│  └── Max: 2-3 requests at 4K context (131KB/token × 4K = 524MB/request)                                    │
+│                                                                                                             │
+│  TIMELINE (1024×1024 image + 50 prompt → 200 output)                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ 0ms───100ms───500ms───1000ms───5000ms───10000ms───11000ms                                              ││
+│  │ [10ms] Tokenize (CPU)                                                                                   ││
+│  │      [80ms] Vision: Conv3D(15ms)+ViT×32(60ms)+Merge(5ms), SM:50%                                       ││
+│  │                [5ms] KV Alloc                                                                           ││
+│  │                    [600ms] Prefill: FlashInfer, 32 layers, Bottleneck: Compute                         ││
+│  │                                              [10000ms] Decode: 200×50ms, Bottleneck: BW                ││
+│  │ TOTAL: 10.7s | 19 tok/s                                                                                 ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  vllm serve Qwen/Qwen3-VL-8B-Instruct --dtype float16 --quantization bitsandbytes \                        │
+│      --max-model-len 4096 --max-num-seqs 2 --gpu-memory-utilization 0.92 --enforce-eager                   │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-8B ON A100-80GB: STEP-BY-STEP EXECUTION                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  CONFIGURATION                                                                                              │
+│  Model: Qwen3-VL-8B, Precision: BF16, Attention: FlashAttn2 (SM 8.0), KV: BF16, CUDA Graphs: ON            │
+│                                                                                                             │
+│  MEMORY: 80GB A100 HBM2e (2 TB/s bandwidth)                                                                │
+│  ├── BF16 Weights: 16.6GB | ViT: 2.0GB | Activations: 4.0GB | CUDA+Graphs: 3.0GB | KV: 54GB               │
+│  └── Max: 25 requests at 16K context (131KB/token × 16K = 2.1GB/request)                                   │
+│                                                                                                             │
+│  TIMELINE                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ 0ms───50ms───200ms───500ms───1000ms───2000ms───2500ms                                                  ││
+│  │ [5ms] Tokenize                                                                                          ││
+│  │     [25ms] Vision: FA2 optimized, SM:75%, Tensor Core:80%                                              ││
+│  │            [2ms] KV                                                                                     ││
+│  │               [120ms] Prefill: FlashAttn2 fused, 108 SMs, 312 TFLOPS                                   ││
+│  │                                [2400ms] Decode: 200×12ms, 2 TB/s near-saturation                       ││
+│  │ TOTAL: 2.5s | 80 tok/s                                                                                  ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  vllm serve Qwen/Qwen3-VL-8B-Instruct --dtype bfloat16 --max-model-len 32768 \                             │
+│      --max-num-seqs 32 --gpu-memory-utilization 0.90 --enable-prefix-caching                               │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-8B ON H100-80GB: STEP-BY-STEP EXECUTION                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  CONFIGURATION                                                                                              │
+│  Model: Qwen3-VL-8B, Precision: FP8, Attention: FlashAttn3+TRTLLM, KV: FP8, CUDA Graphs: ON                │
+│                                                                                                             │
+│  MEMORY: 80GB H100 HBM3 (3.35 TB/s bandwidth)                                                              │
+│  ├── FP8 Weights: 8.3GB | ViT: 2.0GB | Activations: 4.0GB | CUDA: 3.0GB | KV: 62GB                        │
+│  └── Max: 29 requests at 32K context (65.5KB/token FP8 × 32K = 2.1GB/request)                              │
+│                                                                                                             │
+│  TIMELINE                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ 0ms───20ms───100ms───300ms───600ms───1000ms───1300ms                                                   ││
+│  │ [3ms] Tokenize                                                                                          ││
+│  │    [12ms] Vision: FA3 optimized                                                                         ││
+│  │          [1ms] KV                                                                                       ││
+│  │            [60ms] Prefill: FA3+FP8 Tensor Cores, 132 SMs, TBC                                          ││
+│  │                          [1200ms] Decode: 200×6ms, TRTLLM+TMA, 3.35 TB/s                               ││
+│  │ TOTAL: 1.3s | 157 tok/s                                                                                 ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  vllm serve Qwen/Qwen3-VL-8B-Instruct --dtype bfloat16 --kv-cache-dtype fp8 \                              │
+│      --max-model-len 65536 --max-num-seqs 64 --gpu-memory-utilization 0.90 --enable-prefix-caching         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-8B ON B200-192GB: STEP-BY-STEP EXECUTION                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  CONFIGURATION                                                                                              │
+│  Model: Qwen3-VL-8B, Precision: BF16 (plenty of room), Attention: FlashInfer+TRTLLM, KV: BF16              │
+│                                                                                                             │
+│  MEMORY: 192GB B200 HBM3e (8 TB/s bandwidth)                                                               │
+│  ├── BF16 Weights: 16.6GB | ViT: 2.0GB | Activations: 4.0GB | CUDA: 3.0GB | KV: 166GB                     │
+│  └── Max: 100 requests at 16K context, 9 at 128K context                                                   │
+│                                                                                                             │
+│  TIMELINE                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ 0ms───10ms───50ms───150ms───400ms───650ms                                                              ││
+│  │ [2ms] Tokenize                                                                                          ││
+│  │   [8ms] Vision: 8 TB/s instant data fetch                                                               ││
+│  │        [1ms] KV                                                                                         ││
+│  │          [35ms] Prefill: 192 SMs, 5th Gen Tensor Cores                                                 ││
+│  │                    [600ms] Decode: 200×3ms, 8 TB/s bandwidth                                           ││
+│  │ TOTAL: 0.65s | 310 tok/s                                                                                ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  vllm serve Qwen/Qwen3-VL-8B-Instruct --dtype bfloat16 --max-model-len 131072 \                            │
+│      --max-num-seqs 128 --gpu-memory-utilization 0.90 --enable-prefix-caching --enable-chunked-prefill    │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Execution: Qwen3-VL-32B (GUI Agent Recommended)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-32B ON A100-80GB, H100-80GB, B200-192GB                                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WHY 32B FOR GUI AGENTS: 64 layers (vs 32) = more reasoning depth for multi-step UI tasks                  │
+│  Research shows: Models <32B fail to reliably combine grounding + planning + action                        │
+│                                                                                                             │
+│  ┌───────────────┬─────────────────────────┬─────────────────────────┬─────────────────────────┐           │
+│  │ Metric        │ A100-80GB               │ H100-80GB               │ B200-192GB              │           │
+│  ├───────────────┼─────────────────────────┼─────────────────────────┼─────────────────────────┤           │
+│  │ Precision     │ BF16 (tight fit)        │ FP8 (halves weights)    │ BF16 (plenty room)      │           │
+│  │ Weights       │ 65.6GB / 80GB           │ 32.8GB / 80GB           │ 65.6GB / 192GB          │           │
+│  │ KV Available  │ ~10GB (limited!)        │ ~43GB                   │ ~120GB                  │           │
+│  │ Max Requests  │ 3-4 at 8K context       │ 16 at 8K context        │ 48 at 8K context        │           │
+│  ├───────────────┼─────────────────────────┼─────────────────────────┼─────────────────────────┤           │
+│  │ Vision Enc    │ 50ms                    │ 25ms                    │ 15ms                    │           │
+│  │ Prefill       │ 250ms                   │ 120ms                   │ 70ms                    │           │
+│  │ Decode/tok    │ 25ms                    │ 12ms                    │ 6ms                     │           │
+│  │ Total (200t)  │ 5.3s                    │ 2.5s                    │ 1.3s                    │           │
+│  │ Throughput    │ 38 tok/s                │ 80 tok/s                │ 154 tok/s               │           │
+│  └───────────────┴─────────────────────────┴─────────────────────────┴─────────────────────────┘           │
+│                                                                                                             │
+│  RECOMMENDATION: H100 with FP8 runs 32B at same speed as 8B BF16 on A100!                                  │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Execution: MoE Models
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-30B-A3B (MoE) ON H100-80GB                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  MOE ARCHITECTURE: 30B total (128 experts), 3B active/token (top-8), 10% activation ratio                  │
+│                                                                                                             │
+│  KEY INSIGHT: ALL 128 experts must be in VRAM, but only 8 compute per token                                │
+│                                                                                                             │
+│  PER-TOKEN MoE FLOW:                                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ Token (2048 dim) → Router(2048→128) → top-8 indices → FusedMoE kernel:                                 ││
+│  │   1. Gather: Collect weights for 8 selected experts (6.25% of total)                                   ││
+│  │   2. Compute: Run 8 expert MLPs in parallel (Gate→SiLU→Up→Down)                                        ││
+│  │   3. Combine: Weighted sum of expert outputs                                                            ││
+│  │ → Next layer                                                                                            ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  MEMORY: 80GB H100                                                                                          │
+│  ├── FP8 Expert Weights: 30GB | Shared: 5GB | ViT: 2GB | Activations: 3GB | KV: 39GB                       │
+│  └── KV/token: 24.5KB FP8 — SMALLER than 8B dense! (fewer kv_heads)                                        │
+│                                                                                                             │
+│  TIMELINE                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ Vision: 25ms | Prefill: 75ms | Decode: 200×6ms = 1200ms | TOTAL: 1.3s | 154 tok/s                      ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  WHY MoE > 32B DENSE (same quality, 2× faster decode):                                                     │
+│  • 30B-A3B decode: Read ~8GB active params → 6ms/token                                                     │
+│  • 32B dense decode: Read ~32.8GB all params → 12ms/token                                                  │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     QWEN3-VL-235B-A22B (MoE) ON 8×H100-80GB                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  MOE ARCHITECTURE: 235B total, 22B active/token (top-8 of 128 experts), 94 layers                          │
+│                                                                                                             │
+│  MULTI-GPU LAYOUT (Tensor Parallelism = 8):                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │  GPU 0     GPU 1     GPU 2     GPU 3     GPU 4     GPU 5     GPU 6     GPU 7                           ││
+│  │  [59GB]    [59GB]    [59GB]    [59GB]    [59GB]    [59GB]    [59GB]    [59GB]                           ││
+│  │  16 exp    16 exp    16 exp    16 exp    16 exp    16 exp    16 exp    16 exp                           ││
+│  │  /layer    /layer    /layer    /layer    /layer    /layer    /layer    /layer                           ││
+│  │     └───────┴───────┴───────┴─── NVLink (900 GB/s) ───┴───────┴───────┴───────┘                        ││
+│  │                                                                                                         ││
+│  │  Expert Distribution: 128 experts ÷ 8 GPUs = 16 experts per GPU per layer                             ││
+│  │  All-to-All: When token needs expert on different GPU, NVLink transfers                               ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  TIMELINE                                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+│  │ Vision: 50ms | Prefill: 300ms | Decode: 200×12ms = 2400ms | TOTAL: 2.8s | 71 tok/s                     ││
+│  │                                                                                                         ││
+│  │ Per-Decode-Token: Router(0.2ms) + All-to-All(2ms) + Expert(6ms) + All-Reduce(2ms) + Attn(2ms) = 12ms  ││
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                                             │
+│  WHY 235B-A22B: Frontier-model quality (GPT-4 class) at 10× lower cost per token                           │
+│  8×H100 = ~$100K setup, serves ~200 tok/s with batching                                                    │
+│                                                                                                             │
+│  vllm serve Qwen/Qwen3-VL-235B-A22B --tensor-parallel-size 8 --dtype bfloat16 \                            │
+│      --max-model-len 32768 --max-num-seqs 8 --gpu-memory-utilization 0.90                                  │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Summary: Model Selection by Use Case
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     MODEL SELECTION DECISION GUIDE                                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  USE CASE                         │ RECOMMENDED MODEL     │ MIN GPU          │ LATENCY    │ QUALITY  │ │
+│  │  ─────────────────────────────────┼───────────────────────┼──────────────────┼────────────┼──────────│ │
+│  │  Edge/Mobile deployment           │ 2B                    │ T4 / Consumer    │ <100ms     │ ★★☆☆☆    │ │
+│  │  Real-time chat, basic vision     │ 4B                    │ T4               │ ~200ms     │ ★★★☆☆    │ │
+│  │  Production VQA, document OCR     │ 8B                    │ A100-40GB        │ ~500ms     │ ★★★★☆    │ │
+│  │  GUI agents (SFT+RL reliable)     │ 32B                   │ A100-80GB/H100   │ ~1s        │ ★★★★★    │ │
+│  │  High-throughput production       │ 30B-A3B (MoE)         │ H100-80GB        │ ~500ms     │ ★★★★☆    │ │
+│  │  Frontier quality, cost-optimized │ 235B-A22B (MoE)       │ 4×H100 or 3×B200 │ ~1.5s      │ ★★★★★+   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  KEY TAKEAWAYS:                                                                                             │
+│  1. GUI agents require 32B minimum for reliable SFT+RL training (research-backed)                         │
+│  2. MoE models offer best quality/cost ratio at scale (same quality, 2× decode speed)                     │
+│  3. H100 with FP8 can run 32B at speeds comparable to 8B on A100                                          │
+│  4. B200 is future-proof: 192GB VRAM + 8 TB/s enables single-GPU 32B with massive context                 │
 │                                                                                                             │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
