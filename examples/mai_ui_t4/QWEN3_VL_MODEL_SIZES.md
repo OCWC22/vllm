@@ -3358,71 +3358,129 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 
 ### Method 1: MAI-UI's Self-Evolving Data Pipeline (arXiv:2512.22047)
 
+> **Source**: [MAI-UI Technical Report](https://arxiv.org/abs/2512.22047) - Alibaba Tongyi Lab
+> **Related Paper**: [UI-Ins (arXiv:2510.20286)](https://arxiv.org/abs/2510.20286) - Instruction-as-Reasoning paradigm
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                     MAI-UI: SELF-EVOLVING DATA PIPELINE                                                      │
+│                     MAI-UI: ACTUAL TRAINING METHODOLOGY (CORRECTED)                                         │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
-│  KEY INNOVATION: Multi-perspective instruction generation + rejection sampling                              │
+│  KEY COMPONENTS (from actual paper):                                                                        │
+│  • Self-evolving data pipeline with MLLM-as-a-judge                                                        │
+│  • Online RL using GRPO (confirmed!) with Verl infrastructure                                              │
+│  • 500+ concurrent Android Virtual Device instances for parallel training                                  │
+│  • Iterative rejection sampling - keeps longest correct prefixes from failed rollouts                      │
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                                                                                                       │ │
-│  │  STEP 1: GROUNDING DATA GENERATION (4 Human-Like Perspectives)                                        │ │
-│  │  ════════════════════════════════════════════════════════════                                         │ │
+│  │  GUI GROUNDING: INSTRUCTION-AS-REASONING PARADIGM (from UI-Ins paper)                                 │ │
+│  │  ════════════════════════════════════════════════════════════════════                                 │ │
 │  │                                                                                                       │ │
-│  │  Given a UI element, generate instructions from 4 perspectives:                                       │ │
+│  │  MAI-UI uses the Instruction-as-Reasoning paradigm from UI-Ins (arXiv:2510.20286)                    │ │
+│  │  which generates instructions from 4 human-like perspectives:                                         │ │
 │  │                                                                                                       │ │
 │  │  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐ │ │
 │  │  │ Perspective   │ Example for a blue "Submit" button                                              │ │ │
 │  │  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────┤ │ │
 │  │  │ APPEARANCE    │ "Click the blue button with white text"                                         │ │ │
-│  │  │ FUNCTION      │ "Click the button to submit the form"                                           │ │ │
+│  │  │ FUNCTIONALITY │ "Click the button to submit the form"                                           │ │ │
 │  │  │ LOCATION      │ "Click the button at the bottom right of the form"                              │ │ │
 │  │  │ INTENT        │ "Complete your order by clicking the final button"                              │ │ │
 │  │  └───────────────┴─────────────────────────────────────────────────────────────────────────────────┘ │ │
 │  │                                                                                                       │ │
-│  │  WHY THIS WORKS:                                                                                      │ │
-│  │  • Humans describe elements in all these ways                                                        │ │
-│  │  • Model learns to ground from ANY description style                                                 │ │
-│  │  • More robust to real-world instruction variation                                                   │ │
+│  │  Two-stage training for grounding:                                                                    │ │
+│  │  1. SFT Stage: Supervised fine-tuning on multi-perspective instructions                             │ │
+│  │  2. RL Stage: Reinforcement learning for pathway exploration and selection                          │ │
 │  │                                                                                                       │ │
 │  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                                                                                                       │ │
-│  │  STEP 2: NAVIGATION DATA SOURCES (3 Types)                                                            │ │
-│  │  ═════════════════════════════════════════                                                            │ │
+│  │  NAVIGATION DATA PIPELINE (Actual MAI-UI Methodology)                                                 │ │
+│  │  ════════════════════════════════════════════════════                                                 │ │
 │  │                                                                                                       │ │
-│  │  1. REJECTION-SAMPLED TRAJECTORIES                                                                    │ │
-│  │     • Run current model on tasks                                                                      │ │
-│  │     • Keep only successful trajectories                                                               │ │
-│  │     • High quality, but limited to what model can already do                                         │ │
+│  │  STEP 1: SEED TASK COLLECTION                                                                         │ │
+│  │  ────────────────────────────                                                                         │ │
+│  │  Tasks come from 3 sources:                                                                           │ │
+│  │  • App manuals and documentation                                                                      │ │
+│  │  • Hand-designed scenarios by researchers                                                             │ │
+│  │  • Filtered public datasets (open-source data)                                                       │ │
 │  │                                                                                                       │ │
-│  │  2. MANUALLY-ANNOTATED EXPERT TRAJECTORIES                                                            │ │
-│  │     • Human experts perform tasks and annotate                                                        │ │
-│  │     • Highest quality, but expensive and slow                                                        │ │
-│  │     • Use for edge cases model fails on                                                               │ │
+│  │  STEP 2: TRAJECTORY COLLECTION                                                                        │ │
+│  │  ────────────────────────────────                                                                     │ │
+│  │  BOTH agents AND human annotators execute tasks:                                                      │ │
+│  │  • Agent rollouts: Model attempts tasks in Android environments                                      │ │
+│  │  • Expert trajectories: Human annotators perform tasks                                               │ │
+│  │  • All trajectories recorded with screenshots + actions                                              │ │
 │  │                                                                                                       │ │
-│  │  3. AUTOMATIC AGENT ROLLOUTS                                                                          │ │
-│  │     • Let model explore and collect trajectories                                                      │ │
-│  │     • Filter with LLM-based quality checks                                                           │ │
-│  │     • High volume, variable quality                                                                   │ │
+│  │  STEP 3: MLLM-AS-A-JUDGE EVALUATION                                                                   │ │
+│  │  ──────────────────────────────────────                                                               │ │
+│  │  A judge model (MLLM) evaluates each trajectory:                                                      │ │
+│  │  • End-to-end success: Did the task complete?                                                        │ │
+│  │  • Step-level accuracy: Which steps were correct?                                                    │ │
+│  │                                                                                                       │ │
+│  │  CRITICAL INNOVATION: Longest Correct Prefix Extraction                                              │ │
+│  │  • Even if trajectory FAILS overall, extract the correct sub-sequence                                │ │
+│  │  • "Task failed at step 7, but steps 1-6 were correct" → Keep steps 1-6                             │ │
+│  │  • This salvages data from failed attempts!                                                          │ │
+│  │                                                                                                       │ │
+│  │  STEP 4: ITERATIVE REJECTION SAMPLING                                                                 │ │
+│  │  ────────────────────────────────────────                                                             │ │
+│  │  • Train model on high-quality trajectories                                                          │ │
+│  │  • Run model → collect new trajectories → judge → filter → retrain                                  │ │
+│  │  • This is the "self-evolving" loop                                                                  │ │
 │  │                                                                                                       │ │
 │  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                                                                                                       │ │
-│  │  STEP 3: SPECIALIZED DATA AUGMENTATION                                                                │ │
-│  │  ═════════════════════════════════════════                                                            │ │
+│  │  SPECIALIZED DATA AUGMENTATION (Actual MAI-UI Features)                                               │ │
+│  │  ══════════════════════════════════════════════════════                                               │ │
 │  │                                                                                                       │ │
-│  │  AGENT-USER INTERACTION SCENARIOS:                                                                    │ │
-│  │  • Create tasks with deliberately omitted information                                                │ │
-│  │  • Force model to learn to ask clarifying questions                                                  │ │
-│  │  • Example: "Book a flight" without dates → model should ask                                         │ │
+│  │  ACTION SPACE EXPANSION:                                                                              │ │
+│  │  • Standard UI actions: tap, type, scroll, swipe                                                     │ │
+│  │  • *ask_user* action: Request clarification from user                                                │ │
+│  │  • *mcp_call* action: Invoke external tools via MCP (Model Context Protocol)                        │ │
+│  │                                                                                                       │ │
+│  │  AGENT-USER INTERACTION TRAINING:                                                                     │ │
+│  │  • Tasks with deliberately omitted information                                                       │ │
+│  │  • Model learns WHEN to ask for clarification vs guess                                               │ │
+│  │  • Example: "Book a flight" (no destination) → model should ask                                      │ │
 │  │                                                                                                       │ │
 │  │  MCP TOOL INTEGRATION:                                                                                │ │
-│  │  • Create tasks that benefit from external API access                                                │ │
-│  │  • Model learns when to use tools vs pure UI interaction                                             │ │
+│  │  • Tasks that require external API calls                                                             │ │
+│  │  • Model learns when UI interaction isn't enough                                                     │ │
+│  │  • Example: Check weather API instead of opening weather app                                         │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  ONLINE RL FRAMEWORK (MAI-UI's Actual Implementation)                                                 │ │
+│  │  ════════════════════════════════════════════════════                                                 │ │
+│  │                                                                                                       │ │
+│  │  INFRASTRUCTURE:                                                                                      │ │
+│  │  • 500+ concurrent Android Virtual Device (AVD) instances                                            │ │
+│  │  • Docker containers with rooted AVD + backend services                                              │ │
+│  │  • Centralized Environment Manager coordinates all instances                                         │ │
+│  │                                                                                                       │ │
+│  │  RL ALGORITHM: GRPO (Group Relative Policy Optimization)                                             │ │
+│  │  • Built on Verl infrastructure                                                                      │ │
+│  │  • Asynchronous on-policy execution                                                                  │ │
+│  │  • Hybrid parallelism: TP (Tensor) + PP (Pipeline) + CP (Context)                                   │ │
+│  │                                                                                                       │ │
+│  │  REWARDS:                                                                                             │ │
+│  │  • Task completion reward (rule-based verifier OR model judge)                                       │ │
+│  │  • Repetition penalty (penalize looping behaviors)                                                   │ │
+│  │                                                                                                       │ │
+│  │  SCALING RESULTS (from paper):                                                                        │ │
+│  │  • 32 → 512 parallel environments: +5.2 points improvement                                          │ │
+│  │  • 15 → 50 environment steps: +4.3 points improvement                                               │ │
+│  │                                                                                                       │ │
+│  │  CURRICULUM LEARNING:                                                                                 │ │
+│  │  • Tasks stratified by success rate                                                                  │ │
+│  │  • Focus on "frontier" tasks (just beyond current capability)                                       │ │
 │  │                                                                                                       │ │
 │  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                                             │
@@ -3533,29 +3591,33 @@ This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-36
 
 ### GRPO for GUI Agents: How It Works
 
+> **MAI-UI uses GRPO** (confirmed in paper): Built on [Verl](https://github.com/volcengine/verl) infrastructure
+> with asynchronous on-policy execution and hybrid parallelism (TP+PP+CP).
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                     GRPO (GROUP RELATIVE POLICY OPTIMIZATION) FOR GUI GROUNDING                             │
+│                     GRPO (GROUP RELATIVE POLICY OPTIMIZATION) FOR GUI AGENTS                                │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
-│  WHY GRPO > SFT FOR GUI GROUNDING:                                                                          │
-│  ═════════════════════════════════                                                                          │
+│  MAI-UI USES GRPO FOR ONLINE RL (from paper):                                                              │
+│  ═════════════════════════════════════════════                                                              │
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                                                                                                       │ │
-│  │  SFT PROBLEM:                                                                                         │ │
-│  │  ────────────                                                                                         │ │
-│  │  • Target: Center of bounding box (512, 384)                                                         │ │
-│  │  • Prediction: (515, 380) — 5 pixels off                                                             │ │
-│  │  • SFT loss: "WRONG!" (treats as complete failure)                                                   │ │
-│  │  • Reality: Click would succeed (still inside button)                                                │ │
+│  │  WHY GRPO FOR GUI NAVIGATION:                                                                         │ │
+│  │  ────────────────────────────────                                                                     │ │
 │  │                                                                                                       │ │
-│  │  GRPO SOLUTION:                                                                                       │ │
-│  │  ────────────────                                                                                     │ │
-│  │  • Reward function: "Is click inside target region? → +1, else → 0"                                  │ │
-│  │  • Prediction (515, 380) inside button → Reward = +1 ✓                                               │ │
-│  │  • Model learns: "Anywhere inside is good enough"                                                     │ │
-│  │  • More flexible, matches real success criteria                                                       │ │
+│  │  GROUNDING (click accuracy):                                                                          │ │
+│  │  • SFT: Target = center of bbox (512, 384), penalizes ANY deviation                                 │ │
+│  │  • GRPO: Reward = 1 if click inside bbox, else 0 → more flexible                                    │ │
+│  │                                                                                                       │ │
+│  │  NAVIGATION (multi-step tasks):                                                                       │ │
+│  │  • SFT: Requires exact action sequences, brittle to variations                                       │ │
+│  │  • GRPO: Rewards task completion, tolerates different valid paths                                    │ │
+│  │                                                                                                       │ │
+│  │  MAI-UI REWARD DESIGN:                                                                                │ │
+│  │  • Task completion reward: Did the task succeed? (rule-based OR model judge)                        │ │
+│  │  • Repetition penalty: Penalize looping behaviors (clicking same thing)                             │ │
 │  │                                                                                                       │ │
 │  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                                             │
@@ -4187,11 +4249,23 @@ CRITICAL INSIGHT: GRPO only works if base model is capable enough
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### MAI-UI Benchmark Results (from paper)
+
+| Benchmark | MAI-UI Score | Previous SOTA | Improvement |
+|-----------|--------------|---------------|-------------|
+| **ScreenSpot-Pro** (grounding) | 73.5% | - | New SOTA |
+| **MMBench GUI L2** | 91.3% | - | New SOTA |
+| **AndroidWorld** (online) | 76.7% | Gemini 2.5 Pro, Seed1.8, UI-TARS-2 | Surpasses all |
+| **MobileWorld** | 41.7% | - | New SOTA |
+
+> Device-cloud collaboration: +33% on-device performance, -40% cloud calls
+
 ### Summary: The Complete Training Recipe
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                     COMPLETE RECIPE: FROM BASE MODEL TO RELIABLE GUI AGENT                                  │
+│                     (Based on MAI-UI + UI-Ins + OS-Genesis methodologies)                                   │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
@@ -4234,19 +4308,33 @@ CRITICAL INSIGHT: GRPO only works if base model is capable enough
 │  │                                                                                                       │ │
 │  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                                             │
-│  KEY TAKEAWAYS:                                                                                             │
-│  ═══════════════                                                                                            │
+│  KEY TAKEAWAYS (Verified from Papers):                                                                      │
+│  ══════════════════════════════════════                                                                     │
 │                                                                                                             │
-│  ✓ Model size matters: 32B minimum for reliable GUI agents                                                 │
-│  ✓ Data quality > Data quantity: Curated 145K > noisy 10M                                                  │
-│  ✓ Instruction diversity: 4 perspectives (appearance, function, location, intent)                         │
-│  ✓ Reverse synthesis: Let exploration drive task discovery                                                 │
-│  ✓ Simple rewards work: Click-inside-bbox is sufficient                                                    │
-│  ✓ GRPO needs base capability: Smaller models produce no learning signal                                   │
-│  ✓ Include edge cases: Failure recovery, clarification, error handling                                     │
+│  ✓ Model size matters: 32B minimum for reliable GUI agents (MAI-UI uses 2B/8B/32B/235B-A22B)              │
+│  ✓ MLLM-as-a-judge: Use LLM to evaluate trajectories and extract correct prefixes from failures           │
+│  ✓ Instruction-as-Reasoning: 4 perspectives (appearance, functionality, location, intent) from UI-Ins     │
+│  ✓ GRPO on Verl: MAI-UI uses GRPO with 500+ parallel Android environments                                 │
+│  ✓ Reward design: Task completion (rule/model judge) + repetition penalty                                  │
+│  ✓ Self-evolving loop: Train → rollout → judge → filter → retrain                                         │
+│  ✓ Action space expansion: Standard UI + *ask_user* + *mcp_call*                                          │
+│  ✓ Scaling helps: 32→512 envs = +5.2 pts, 15→50 steps = +4.3 pts                                          │
 │                                                                                                             │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Paper References
+
+| Paper | arXiv ID | Key Contribution |
+|-------|----------|------------------|
+| **MAI-UI Technical Report** | [2512.22047](https://arxiv.org/abs/2512.22047) | Self-evolving pipeline, GRPO on Verl, device-cloud collaboration |
+| **UI-Ins** | [2510.20286](https://arxiv.org/abs/2510.20286) | Instruction-as-Reasoning paradigm, 4 perspectives |
+| **OS-Genesis** | [2412.19723](https://arxiv.org/abs/2412.19723) | Reverse task synthesis, trajectory reward model |
+| **UI-R1** | [2503.21620](https://arxiv.org/abs/2503.21620) | GRPO for GUI action prediction with Qwen2.5-VL |
+| **FaraGen/Fara-7B** | - | Multi-agent synthetic data engine, 145K trajectories |
+| **GUI-360** | - | LLM-augmented pipeline for Windows apps |
+| **UGround** | - | 10M elements, 1.3M screenshots for grounding |
+| **OS-ATLAS** | - | 13M elements, open-source synthesis toolkit |
 
 ---
 
