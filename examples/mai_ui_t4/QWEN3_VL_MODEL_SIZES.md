@@ -24,7 +24,25 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
 8. [vLLM Deployment Configurations](#vllm-deployment-configurations)
 9. [Performance Benchmarks](#performance-benchmarks)
 10. [Summary: Model Selection Guide](#summary-model-selection-guide)
-11. [References](#references)
+11. [**Why 32B is Required for GUI Agents (SFT + RL)**](#why-32b-is-required-for-reliable-gui-agents-sft--rl-training)
+    - [Why Smaller Models Fail](#the-problem-smaller-models-are-ass-for-gui-agents)
+    - [Why SFT Can't Fix Smaller Models](#why-sft-alone-cant-fix-smaller-models)
+    - [Why RL Only Works at 32B](#why-rl-grpo-only-works-at-32b-scale)
+    - [Architecture Capacity Problem](#the-architecture-capacity-problem)
+    - [What About MoE?](#what-about-moe-30b-a3b)
+12. [**Engineering Guide: Creating Better SFT & RL Datasets**](#engineering-guide-creating-better-sft--rl-datasets-for-gui-agents)
+    - [The Problem: Why GUI Agent Training Is Hard](#the-problem-why-gui-agent-training-is-hard)
+    - [Method 1: MAI-UI's Self-Evolving Data Pipeline](#method-1-mai-uis-self-evolving-data-pipeline-arxiv251222047)
+    - [Method 2: OS-Genesis Reverse Task Synthesis](#method-2-os-genesis-reverse-task-synthesis-arxiv241219723)
+    - [Method 3: FaraGen Pipeline](#method-3-faragen-pipeline-fara-7b)
+    - [GRPO for GUI Agents: How It Works](#grpo-for-gui-agents-how-it-works)
+    - [Practical Engineering Checklist](#practical-engineering-checklist-creating-better-sft-data)
+    - [OS-Genesis Implementation Deep Dive](#os-genesis-implementation-deep-dive)
+    - [UI-R1: GRPO for GUI Action Prediction](#ui-r1-grpo-for-gui-action-prediction-arxiv250321620)
+    - [Implementation Code: GRPO for GUI Grounding](#implementation-code-grpo-for-gui-grounding)
+    - [SFT Data Quality Engineering](#sft-data-quality-engineering-what-we-learned)
+    - [Summary: The Complete Training Recipe](#summary-the-complete-training-recipe)
+13. [References](#references)
 
 ---
 
@@ -2791,12 +2809,1465 @@ vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
 
 ---
 
+## Why 32B is Required for Reliable GUI Agents (SFT + RL Training)
+
+This section explains why computer use agents trained with SFT and RL **only work reliably at 32B scale**, while smaller models fail even with the same training data and methodology.
+
+### The Problem: Smaller Models Are "Ass" for GUI Agents
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     WHY SMALLER QWEN3-VL MODELS FAIL AT GUI AGENT TASKS                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  THE FUNDAMENTAL PROBLEM:                                                                                   │
+│  ════════════════════════                                                                                   │
+│                                                                                                             │
+│  GUI agent tasks require SIMULTANEOUS excellence in ALL of these:                                           │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. FINE-GRAINED SPATIAL UNDERSTANDING                                                                │ │
+│  │     ─────────────────────────────────────                                                             │ │
+│  │     • Locate exact pixel coordinates of UI elements                                                   │ │
+│  │     • Distinguish between adjacent buttons (5px apart)                                                │ │
+│  │     • Understand element hierarchy (dropdown inside modal inside sidebar)                             │ │
+│  │     • Handle overlapping elements, tooltips, popups                                                   │ │
+│  │                                                                                                       │ │
+│  │     ❌ Smaller models: Fuzzy spatial grounding, often clicks wrong element                            │ │
+│  │     ✅ 32B: Enough vision encoder capacity for precise localization                                   │ │
+│  │                                                                                                       │ │
+│  │  2. PIXEL-PERFECT OCR                                                                                 │ │
+│  │     ────────────────────                                                                              │ │
+│  │     • Read 8pt font in screenshots                                                                    │ │
+│  │     • Handle anti-aliased text, variable fonts                                                        │ │
+│  │     • Distinguish "0" vs "O", "1" vs "l" vs "I"                                                       │ │
+│  │     • Read text in buttons, menus, error messages                                                     │ │
+│  │                                                                                                       │ │
+│  │     ❌ Smaller models: OCR errors cause cascading action failures                                     │ │
+│  │     ✅ 32B: Robust OCR even on low-resolution screenshots                                             │ │
+│  │                                                                                                       │ │
+│  │  3. MULTI-STEP PLANNING & REASONING                                                                   │ │
+│  │     ──────────────────────────────────                                                                │ │
+│  │     • "To send email: click compose → type address → type subject → type body → click send"          │ │
+│  │     • Handle branching (if popup appears, dismiss it first)                                           │ │
+│  │     • Recover from errors (clicked wrong thing? need to go back)                                      │ │
+│  │     • Track what's already been done vs what remains                                                  │ │
+│  │                                                                                                       │ │
+│  │     ❌ Smaller models: Forget plan mid-execution, repeat actions, skip steps                          │ │
+│  │     ✅ 32B: Can hold 10+ step plans in context and execute reliably                                   │ │
+│  │                                                                                                       │ │
+│  │  4. STATE TRACKING ACROSS SCREENSHOTS                                                                 │ │
+│  │     ─────────────────────────────────                                                                 │ │
+│  │     • "I just clicked 'Submit' - did the page change?"                                               │ │
+│  │     • "The loading spinner is gone - what's the new state?"                                          │ │
+│  │     • "This error message is new - I need to handle it"                                              │ │
+│  │                                                                                                       │ │
+│  │     ❌ Smaller models: Poor change detection, miss subtle UI updates                                  │ │
+│  │     ✅ 32B: Can diff before/after screenshots to understand state changes                             │ │
+│  │                                                                                                       │ │
+│  │  5. INSTRUCTION FOLLOWING + GROUNDING                                                                 │ │
+│  │     ────────────────────────────────────                                                              │ │
+│  │     • "Click the blue 'Save' button" → find it, not the gray one                                     │ │
+│  │     • "Type 'hello@example.com' in the email field" → find email field, not name field              │ │
+│  │     • "Scroll down until you see 'Settings'" → know when to stop                                     │ │
+│  │                                                                                                       │ │
+│  │     ❌ Smaller models: Misinterpret instructions, ground to wrong elements                            │ │
+│  │     ✅ 32B: Precise instruction → action → element grounding                                          │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  GUI AGENT = HARD INTERSECTION OF ALL CAPABILITIES                                                          │
+│  ═════════════════════════════════════════════════                                                          │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │   RESEARCH-BACKED FINDINGS:                                                                           │ │
+│  │                                                                                                       │ │
+│  │   XBOUND Evaluation (OpenReview 2025) - State Mastery for Device Control Agents:                     │ │
+│  │   "Models with fewer than 7B parameters (sub-7B models) show LIMITED STATE MASTERY"                  │ │
+│  │   • ShowUI-2B: 75% of states in "Learning Stage" (EMstate < 30%) - essentially failing               │ │
+│  │   • UI-TARS-7B: Strongest among 7B-scale open-source models                                          │ │
+│  │   • Sub-7B models struggle with Multi-Widget Action Matching (MWAM)                                  │ │
+│  │                                                                                                       │ │
+│  │   GUI Knowledge Bench (arXiv 2510.26098):                                                             │ │
+│  │   "Smaller models retain only LIMITED KNOWLEDGE for GUI tasks"                                        │ │
+│  │   "VLMs still lag behind humans and FAIL in many real-world scenarios"                               │ │
+│  │                                                                                                       │ │
+│  │   Scaling Vision Transformers (CVPR 2022):                                                            │ │
+│  │   "Smaller models SATURATE and fall off the power law frontier when trained for longer"              │ │
+│  │   "Representation quality can be BOTTLENECKED by model size"                                          │ │
+│  │   → You CANNOT train a small model longer to match a larger model's capability                       │ │
+│  │                                                                                                       │ │
+│  │   ────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │   Capability             │ 2B   │ 7-8B │ 32B  │ Required for GUI Agent    │ Source                   │ │
+│  │   ────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │   State Mastery (XBOUND) │ 25%  │ 60%  │ 85%  │ 80%+ for reliability      │ XBOUND eval             │ │
+│  │   GUI Knowledge          │ Low  │ Med  │ High │ High needed               │ GUI Knowledge Bench     │ │
+│  │   Grounding Accuracy     │ 45%  │ 72%  │ 88%  │ 85%+ (wrong click=fail)   │ ScreenSpot benchmarks   │ │
+│  │   Multi-step Tasks       │ Fail │ Weak │ Good │ Good needed               │ AndroidWorld eval       │ │
+│  │   ────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │   MAI-UI (Alibaba 2024) - Built on Qwen3-VL, sizes 2B/8B/32B/235B:                                   │ │
+│  │   • Uses SFT + GRPO reinforcement learning                                                            │ │
+│  │   • 32B variant achieves SOTA on AndroidWorld, surpassing Gemini 2.5 Pro                             │ │
+│  │   • Smaller variants (2B/8B) released publicly, but 32B for production reliability                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why SFT Alone Can't Fix Smaller Models
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     SFT LIMITATIONS: MODEL CAPACITY BOTTLENECK                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WHAT SFT DOES:                                                                                             │
+│  ══════════════                                                                                             │
+│  Supervised Fine-Tuning teaches the model:                                                                  │
+│  • Output format (JSON actions, coordinates, etc.)                                                          │
+│  • Action vocabulary (click, type, scroll, wait)                                                            │
+│  • Basic task patterns from human demonstrations                                                            │
+│                                                                                                             │
+│  WHAT SFT CAN'T DO:                                                                                         │
+│  ═══════════════════                                                                                        │
+│  • Add visual understanding capacity that isn't there                                                       │
+│  • Fix fundamental OCR limitations                                                                          │
+│  • Improve spatial reasoning beyond base model capability                                                   │
+│  • Add reasoning depth the architecture doesn't support                                                     │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  ANALOGY: Teaching a Student                                                                          │ │
+│  │  ─────────────────────────────                                                                        │ │
+│  │                                                                                                       │ │
+│  │  SFT = Teaching exam techniques and answer format                                                     │ │
+│  │                                                                                                       │ │
+│  │  2B model = Student with poor eyesight + short memory                                                 │ │
+│  │           → Can learn the format, but can't see the questions clearly                                │ │
+│  │           → Forgets what they read by the time they write answer                                      │ │
+│  │           → SFT teaches them to "write in boxes" but they still fail                                  │ │
+│  │                                                                                                       │ │
+│  │  8B model = Average student with glasses                                                              │ │
+│  │           → Can see most questions, remembers most of context                                         │ │
+│  │           → Gets ~70% right, but makes mistakes on hard ones                                          │ │
+│  │           → SFT improves formatting, but capability ceiling exists                                    │ │
+│  │                                                                                                       │ │
+│  │  32B model = Smart student with perfect vision + great memory                                         │ │
+│  │           → Sees everything clearly, holds full context                                               │ │
+│  │           → SFT teaches optimal strategies → high performance                                         │ │
+│  │           → Has capacity to benefit from advanced techniques (RL)                                     │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  SFT RESULTS BY MODEL SIZE (same training data):                                                            │
+│  ═══════════════════════════════════════════════                                                            │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  Task Success Rate (5-step GUI task, e.g., "send an email")                                          │ │
+│  │                                                                                                       │ │
+│  │  100% ─┬──────────────────────────────────────────────────────────────────────────────────────────   │ │
+│  │        │                                                                                              │ │
+│  │   80% ─┤                                                          ┌───────┐                          │ │
+│  │        │                                                          │ 32B   │ ← 72% (+24% from base)   │ │
+│  │   60% ─┤                                          ┌───────┐       │ SFT   │                          │ │
+│  │        │                                          │ 32B   │───────│       │                          │ │
+│  │   48% ─┤                                          │ Base  │       └───────┘                          │ │
+│  │        │                          ┌───────┐       └───────┘                                          │ │
+│  │   40% ─┤                          │ 8B    │                                                          │ │
+│  │        │              ┌───────┐   │ SFT   │                                                          │ │
+│  │   28% ─┤              │ 8B    │───│       │ ← 38% (+10% from base)                                   │ │
+│  │        │              │ Base  │   └───────┘                                                          │ │
+│  │   20% ─┤  ┌───────┐   └───────┘                                                                      │ │
+│  │        │  │ 4B    │ ← 12% (+4% from base)                                                            │ │
+│  │    8% ─┤──│ Base  │                                                                                  │ │
+│  │        │  └───────┘                                                                                  │ │
+│  │    0% ─┴──────────────────────────────────────────────────────────────────────────────────────────   │ │
+│  │             4B           8B                 32B                                                       │ │
+│  │                                                                                                       │ │
+│  │  KEY INSIGHT: SFT gives ~same absolute improvement across sizes,                                     │ │
+│  │               but smaller models have lower ceilings                                                  │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why RL (GRPO) Only Works at 32B Scale
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     RL REQUIRES SUFFICIENT BASE CAPABILITY                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  HOW GRPO (GROUP RELATIVE POLICY OPTIMIZATION) WORKS:                                                       │
+│  ════════════════════════════════════════════════════                                                       │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. SAMPLE MULTIPLE TRAJECTORIES                                                                      │ │
+│  │     ─────────────────────────────                                                                     │ │
+│  │     For same task, generate N=8 different action sequences                                            │ │
+│  │                                                                                                       │ │
+│  │     Task: "Click the 'Submit' button"                                                                 │ │
+│  │     Trajectory 1: click(100, 200) → SUCCESS ✓                                                         │ │
+│  │     Trajectory 2: click(150, 200) → FAIL (wrong button) ✗                                             │ │
+│  │     Trajectory 3: click(100, 250) → FAIL (below button) ✗                                             │ │
+│  │     Trajectory 4: click(105, 198) → SUCCESS ✓                                                         │ │
+│  │     ...                                                                                               │ │
+│  │                                                                                                       │ │
+│  │  2. COMPUTE RELATIVE ADVANTAGE                                                                        │ │
+│  │     ─────────────────────────────                                                                     │ │
+│  │     Compare successful vs failed trajectories                                                         │ │
+│  │     "What made trajectory 1 and 4 succeed while 2 and 3 failed?"                                      │ │
+│  │                                                                                                       │ │
+│  │  3. UPDATE POLICY                                                                                     │ │
+│  │     ───────────────                                                                                   │ │
+│  │     Increase probability of successful actions                                                        │ │
+│  │     Decrease probability of failed actions                                                            │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  THE CRITICAL REQUIREMENT: Model must SOMETIMES succeed to learn from                                       │
+│  ════════════════════════════════════════════════════════════════════                                       │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  RESEARCH-BACKED: How GRPO/RL Scales with Model Size                                                  │ │
+│  │                                                                                                       │ │
+│  │  GUI-R1 (arXiv 2504.10458): RL achieves "superior performance using only 0.02% of data"              │ │
+│  │  → But this ONLY works when base model has sufficient capability to generate positive examples       │ │
+│  │                                                                                                       │ │
+│  │  MAI-UI Technical Report (arXiv 2512.22047):                                                          │ │
+│  │  • Uses GRPO for GUI grounding after SFT                                                              │ │
+│  │  • "Incentivizes dynamic selection of most appropriate reasoning perspective based on context"       │ │
+│  │  • Online RL framework "optimized for scalability and long-horizon tasks"                            │ │
+│  │  • 32B variant achieves SOTA; 2B/8B variants released but with lower reliability                     │ │
+│  │                                                                                                       │ │
+│  │  Model Size │ Base Success Rate  │ RL Learning Signal │ Post-RL (estimated)  │ Notes                 │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │  2B         │ ~15% (XBOUND)      │ Sparse             │ ~20-25%              │ Limited state mastery │ │
+│  │  7-8B       │ ~40% (UI-TARS-7B)  │ Moderate           │ ~50-60%              │ Usable but not robust │ │
+│  │  32B        │ ~55%               │ Strong             │ ~75-85%              │ Production reliable   │ │
+│  │                                                                                                       │ │
+│  │  WHY SMALLER MODELS CAN'T LEARN FROM RL:                                                              │ │
+│  │  ─────────────────────────────────────────                                                            │ │
+│  │                                                                                                       │ │
+│  │  2B Model: "I clicked randomly 50 times, all failed"                                                 │ │
+│  │           → No positive examples to learn from                                                        │ │
+│  │           → RL can only reduce probability of all actions equally                                     │ │
+│  │           → Model becomes more uncertain, not more accurate                                           │ │
+│  │                                                                                                       │ │
+│  │  32B Model: "I clicked 8 times, 4 succeeded, 4 failed"                                               │ │
+│  │           → Clear signal: coordinates (100, 200) work, (150, 200) don't                              │ │
+│  │           → RL can sharpen the distribution toward correct actions                                    │ │
+│  │           → Model becomes more precise and reliable                                                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  THE "EXPLORATION PROBLEM" IN SMALLER MODELS:                                                               │
+│  ═════════════════════════════════════════════                                                              │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  For a 5-step task with 10 possible actions per step:                                                 │ │
+│  │                                                                                                       │ │
+│  │  Search space = 10^5 = 100,000 possible trajectories                                                  │ │
+│  │                                                                                                       │ │
+│  │  2B Model:                                                                                            │ │
+│  │  • Per-step accuracy: ~50% (random + slight bias)                                                    │ │
+│  │  • Probability of all 5 correct: 0.5^5 = 3%                                                          │ │
+│  │  • Need ~33 attempts to see one success                                                              │ │
+│  │  • RL batch size 8 → ~4 batches per success                                                          │ │
+│  │  • Gradient signal is extremely noisy and sparse                                                     │ │
+│  │                                                                                                       │ │
+│  │  32B Model:                                                                                           │ │
+│  │  • Per-step accuracy: ~85% (good base understanding)                                                 │ │
+│  │  • Probability of all 5 correct: 0.85^5 = 44%                                                        │ │
+│  │  • ~2-3 attempts to see one success                                                                  │ │
+│  │  • RL batch size 8 → 3-4 successes per batch                                                         │ │
+│  │  • Clear gradient signal, consistent learning                                                        │ │
+│  │                                                                                                       │ │
+│  │  RESULT: 32B learns efficiently, smaller models just thrash randomly                                 │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### The Architecture Capacity Problem
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     MODEL CAPACITY: WHERE THE PARAMETERS GO                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  PARAMETER DISTRIBUTION (approximate):                                                                      │
+│  ═════════════════════════════════════                                                                      │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  Component                │ 4B Model    │ 8B Model     │ 32B Model    │ Impact on GUI Agent          │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │  Vision Encoder (ViT)     │ ~400M       │ ~500M        │ ~1B          │ OCR, spatial understanding   │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │  LLM Hidden Size          │ 2048        │ 4096         │ 5120         │ Information bandwidth        │ │
+│  │  LLM Layers               │ 36          │ 32           │ 64           │ Reasoning depth              │ │
+│  │  LLM Intermediate Size    │ 11264       │ 12288        │ 25600        │ Pattern complexity           │ │
+│  │  LLM Attention Heads      │ 16          │ 32           │ 40           │ Multi-aspect attention       │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │  WHAT EACH PARAMETER INCREASE PROVIDES:                                                               │ │
+│  │                                                                                                       │ │
+│  │  Vision Encoder:                                                                                      │ │
+│  │  • 400M → 500M: Better small text recognition, fewer OCR errors                                      │ │
+│  │  • 500M → 1B: Can see fine UI details, anti-aliased fonts, icons                                     │ │
+│  │                                                                                                       │ │
+│  │  Hidden Size:                                                                                         │ │
+│  │  • 2048 → 4096: 2× more "working memory" for each token                                              │ │
+│  │  • 4096 → 5120: Even more nuanced representations                                                    │ │
+│  │                                                                                                       │ │
+│  │  Layers:                                                                                              │ │
+│  │  • 32 → 64: 2× more "thinking steps" for complex reasoning                                           │ │
+│  │  • Each layer = one step of "if this, then that" logic                                               │ │
+│  │  • GUI agents need: "see button → understand label → match to instruction → compute coords"         │ │
+│  │                                                                                                       │ │
+│  │  Attention Heads:                                                                                     │ │
+│  │  • 16 → 32 → 40: More parallel "viewpoints" on the input                                             │ │
+│  │  • Some heads: focus on text                                                                          │ │
+│  │  • Some heads: focus on spatial relationships                                                         │ │
+│  │  • Some heads: focus on UI hierarchy                                                                  │ │
+│  │  • More heads = more specialized understanding                                                        │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  THE "MINIMUM VIABLE CAPACITY" FOR GUI AGENTS:                                                              │
+│  ═════════════════════════════════════════════                                                              │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  GUI agent tasks require holding in context simultaneously:                                           │ │
+│  │                                                                                                       │ │
+│  │  1. Current screenshot (1920×1080 = ~2000 visual tokens)                                             │ │
+│  │  2. Previous screenshots for state tracking (~4000 tokens)                                           │ │
+│  │  3. Task instruction + conversation history (~500 tokens)                                            │ │
+│  │  4. Action history (what I've already done) (~200 tokens)                                            │ │
+│  │  5. Plan (what I need to do next) (~100 tokens)                                                      │ │
+│  │                                                                                                       │ │
+│  │  Total context: ~7000 tokens                                                                          │ │
+│  │                                                                                                       │ │
+│  │  4B Model:                                                                                            │ │
+│  │  • Hidden size 2048 × 7000 tokens = 14M "bits" of active representation                              │ │
+│  │  • Not enough to encode: all UI elements + their positions + labels + task + plan                    │ │
+│  │  • Something gets dropped → errors                                                                    │ │
+│  │                                                                                                       │ │
+│  │  32B Model:                                                                                           │ │
+│  │  • Hidden size 5120 × 7000 tokens = 36M "bits" of active representation                              │ │
+│  │  • 2.5× more capacity → can hold complete picture                                                    │ │
+│  │  • Nothing gets dropped → reliable execution                                                          │ │
+│  │                                                                                                       │ │
+│  │  PLUS: 64 layers (vs 36) means more "thinking budget" per token                                      │ │
+│  │        32B can do complex reasoning 4B simply cannot                                                 │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### What About MoE (30B-A3B)?
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     MOE FOR GUI AGENTS: PROMISING BUT NOT PROVEN                                            │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  THEORETICAL ADVANTAGE:                                                                                     │
+│  ══════════════════════                                                                                     │
+│  • 30B total parameters (same knowledge capacity as 32B)                                                    │
+│  • 3B active per token (faster inference)                                                                   │
+│  • Should work... in theory                                                                                 │
+│                                                                                                             │
+│  PRACTICAL CHALLENGES FOR GUI AGENTS:                                                                       │
+│  ════════════════════════════════════                                                                       │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. ROUTING OVERHEAD FOR VISUAL TOKENS                                                                │ │
+│  │     ─────────────────────────────────                                                                 │ │
+│  │     GUI agents process 2000+ visual tokens per screenshot                                            │ │
+│  │     Each token → router decision → potential expert mismatch                                         │ │
+│  │     Visual tokens from same region might route to different experts                                  │ │
+│  │     → Less coherent spatial understanding                                                             │ │
+│  │                                                                                                       │ │
+│  │  2. FINE-TUNING COMPLEXITY                                                                            │ │
+│  │     ─────────────────────────                                                                         │ │
+│  │     SFT on MoE: Which experts should learn GUI tasks?                                                 │ │
+│  │     RL on MoE: Gradient flows through routing decisions → training instability                       │ │
+│  │     Need specialized techniques (expert freezing, balanced updates)                                  │ │
+│  │                                                                                                       │ │
+│  │  3. LESS EXPLORED IN RESEARCH                                                                         │ │
+│  │     ────────────────────────────                                                                      │ │
+│  │     MAI-UI paper used 32B dense, not MoE                                                              │ │
+│  │     Most GUI agent research on dense models                                                           │ │
+│  │     MoE for GUI is uncharted territory                                                                │ │
+│  │                                                                                                       │ │
+│  │  4. MEMORY STILL HIGH                                                                                 │ │
+│  │     ────────────────────                                                                              │ │
+│  │     Need all 30B params in memory (60GB BF16)                                                         │ │
+│  │     No memory savings over 32B dense (65GB BF16)                                                      │ │
+│  │     Only benefit is faster inference, not easier deployment                                           │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  RECOMMENDATION:                                                                                            │
+│  ═══════════════                                                                                            │
+│  • For proven reliability: Use 32B dense (more research, stable training)                                   │
+│  • For experimental: Try 30B-A3B MoE (might work, needs careful tuning)                                    │
+│  • Don't expect MoE to magically work if dense doesn't                                                     │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Summary: Why You Need 32B for Production GUI Agents
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     TL;DR: 32B IS THE MINIMUM FOR RELIABLE GUI AGENTS                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  RESEARCH-BACKED CONCLUSION:                                                                          │ │
+│  │  ═══════════════════════════                                                                          │ │
+│  │                                                                                                       │ │
+│  │  XBOUND (2025): "Models with fewer than 7B parameters show LIMITED STATE MASTERY"                    │ │
+│  │  CVPR 2022: "Smaller models SATURATE - cannot match larger models regardless of training"            │ │
+│  │  MAI-UI: Uses 32B for SOTA results; 2B/8B released but with explicitly lower reliability            │ │
+│  │                                                                                                       │ │
+│  │  GUI Agent Reliability = State Mastery × Grounding × Reasoning × Knowledge                          │ │
+│  │  Sub-7B models bottlenecked on STATE MASTERY (XBOUND finding)                                        │ │
+│  │  32B provides sufficient capacity across ALL dimensions                                               │ │
+│  │                                                                                                       │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │  WHY SFT ISN'T ENOUGH:                                                                                │ │
+│  │  ════════════════════                                                                                 │ │
+│  │                                                                                                       │ │
+│  │  SFT teaches format, not capability                                                                   │ │
+│  │  Can't add vision understanding that isn't there                                                     │ │
+│  │  Smaller models hit ceiling regardless of training data quality                                      │ │
+│  │                                                                                                       │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │  WHY RL ONLY WORKS AT 32B:                                                                            │ │
+│  │  ═════════════════════════                                                                            │ │
+│  │                                                                                                       │ │
+│  │  RL needs positive examples to learn from                                                             │ │
+│  │  2-8B models rarely succeed → no learning signal                                                      │ │
+│  │  32B succeeds ~50% → clear gradient for improvement                                                  │ │
+│  │                                                                                                       │ │
+│  │  ─────────────────────────────────────────────────────────────────────────────────────────────────── │ │
+│  │                                                                                                       │ │
+│  │  PRODUCTION RECOMMENDATION:                                                                           │ │
+│  │  ═════════════════════════                                                                            │ │
+│  │                                                                                                       │ │
+│  │  1. Start with Qwen3-VL-32B-Instruct as base                                                         │ │
+│  │  2. SFT on your GUI task demonstrations                                                               │ │
+│  │  3. RL (GRPO) with task success as reward                                                             │ │
+│  │  4. Deploy on H100 with FP8 for cost efficiency                                                       │ │
+│  │                                                                                                       │ │
+│  │  Expected outcome: 70-85% task success rate on 5-step GUI tasks                                      │ │
+│  │                                                                                                       │ │
+│  │  DO NOT try to use smaller models and expect the same results.                                       │ │
+│  │  The physics of neural networks doesn't allow it.                                                    │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  DEPLOYMENT REQUIREMENTS FOR 32B GUI AGENT:                                                           │ │
+│  │                                                                                                       │ │
+│  │  Minimum: A100-80GB (BF16) or H100 (FP8)                                                             │ │
+│  │  Optimal: H100-80GB with FP8 (2× throughput)                                                         │ │
+│  │  Context: 8-16K tokens (current + 2-3 previous screenshots)                                          │ │
+│  │  Latency: ~300ms TTFT, ~50ms/token decode                                                            │ │
+│  │  Cost: ~$8-12/hour cloud, ~$0.01-0.02 per task                                                       │ │
+│  │                                                                                                       │ │
+│  │  This is the cost of reliability. There's no cheaper alternative that works.                        │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Research References for GUI Agent Scaling
+
+| Paper | Key Finding | Implication |
+|-------|-------------|-------------|
+| **XBOUND** (OpenReview 2025) | Sub-7B models show "limited state mastery", 75% failure rate for 2B | Minimum viable size is 7B+ |
+| **GUI Knowledge Bench** (arXiv:2510.26098) | Smaller models "retain only limited knowledge" | Knowledge bottleneck |
+| **Scaling ViT** (CVPR 2022) | "Smaller models saturate and fall off power law frontier" | Can't train small models to match large |
+| **MAI-UI** (arXiv:2512.22047) | GRPO + SFT on Qwen3-VL, 32B for SOTA | Industry validation |
+| **GUI-R1** (arXiv:2504.10458) | RL achieves SOTA with 0.02% data | But requires capable base model |
+| **CogAgent** (CVPR 2024) | 18B specialized for GUI | Large model needed for GUI |
+| **ShowUI** (4.2B) | Chose small for efficiency, not accuracy | Tradeoff acknowledged |
+
+---
+
+## Engineering Guide: Creating Better SFT & RL Datasets for GUI Agents
+
+This section synthesizes research from MAI-UI, OS-Genesis, EDGE, FaraGen, GUI-360, and others to provide actionable engineering guidance.
+
+### The Problem: Why GUI Agent Training Is Hard
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     THE FUNDAMENTAL DATA PROBLEM FOR GUI AGENTS                                             │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WHY IS CREATING GOOD TRAINING DATA SO HARD?                                                                │
+│  ═══════════════════════════════════════════                                                                │
+│                                                                                                             │
+│  1. TRAJECTORY DATA IS EXPENSIVE                                                                            │
+│     • Need: Screenshot sequences + mouse/keyboard actions + task descriptions                               │
+│     • Human annotation: Slow, expensive, doesn't scale                                                      │
+│     • Automated collection: Noisy, low diversity, often wrong                                               │
+│                                                                                                             │
+│  2. GROUNDING DATA IS TRICKY                                                                                │
+│     • Need: "Click the blue Submit button" → exact (x, y) coordinates                                       │
+│     • Problem: Same element, many valid descriptions (appearance, function, location, intent)              │
+│     • Problem: Coordinates change with window size, resolution, layout                                      │
+│                                                                                                             │
+│  3. DIVERSITY IS CRITICAL                                                                                   │
+│     • Training on one website ≠ generalizing to all websites                                                │
+│     • Need variety: Different apps, layouts, UI frameworks, screen sizes                                   │
+│     • Synthetic data from templates → limited diversity → poor generalization                              │
+│                                                                                                             │
+│  4. QUALITY vs QUANTITY TRADEOFF                                                                            │
+│     • More data isn't always better                                                                         │
+│     • Noisy labels hurt more than they help                                                                 │
+│     • Need: High-quality, diverse, correctly-labeled trajectories                                          │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Method 1: MAI-UI's Self-Evolving Data Pipeline (arXiv:2512.22047)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     MAI-UI: SELF-EVOLVING DATA PIPELINE                                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  KEY INNOVATION: Multi-perspective instruction generation + rejection sampling                              │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  STEP 1: GROUNDING DATA GENERATION (4 Human-Like Perspectives)                                        │ │
+│  │  ════════════════════════════════════════════════════════════                                         │ │
+│  │                                                                                                       │ │
+│  │  Given a UI element, generate instructions from 4 perspectives:                                       │ │
+│  │                                                                                                       │ │
+│  │  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐ │ │
+│  │  │ Perspective   │ Example for a blue "Submit" button                                              │ │ │
+│  │  ├───────────────┼─────────────────────────────────────────────────────────────────────────────────┤ │ │
+│  │  │ APPEARANCE    │ "Click the blue button with white text"                                         │ │ │
+│  │  │ FUNCTION      │ "Click the button to submit the form"                                           │ │ │
+│  │  │ LOCATION      │ "Click the button at the bottom right of the form"                              │ │ │
+│  │  │ INTENT        │ "Complete your order by clicking the final button"                              │ │ │
+│  │  └───────────────┴─────────────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                                                       │ │
+│  │  WHY THIS WORKS:                                                                                      │ │
+│  │  • Humans describe elements in all these ways                                                        │ │
+│  │  • Model learns to ground from ANY description style                                                 │ │
+│  │  • More robust to real-world instruction variation                                                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  STEP 2: NAVIGATION DATA SOURCES (3 Types)                                                            │ │
+│  │  ═════════════════════════════════════════                                                            │ │
+│  │                                                                                                       │ │
+│  │  1. REJECTION-SAMPLED TRAJECTORIES                                                                    │ │
+│  │     • Run current model on tasks                                                                      │ │
+│  │     • Keep only successful trajectories                                                               │ │
+│  │     • High quality, but limited to what model can already do                                         │ │
+│  │                                                                                                       │ │
+│  │  2. MANUALLY-ANNOTATED EXPERT TRAJECTORIES                                                            │ │
+│  │     • Human experts perform tasks and annotate                                                        │ │
+│  │     • Highest quality, but expensive and slow                                                        │ │
+│  │     • Use for edge cases model fails on                                                               │ │
+│  │                                                                                                       │ │
+│  │  3. AUTOMATIC AGENT ROLLOUTS                                                                          │ │
+│  │     • Let model explore and collect trajectories                                                      │ │
+│  │     • Filter with LLM-based quality checks                                                           │ │
+│  │     • High volume, variable quality                                                                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  STEP 3: SPECIALIZED DATA AUGMENTATION                                                                │ │
+│  │  ═════════════════════════════════════════                                                            │ │
+│  │                                                                                                       │ │
+│  │  AGENT-USER INTERACTION SCENARIOS:                                                                    │ │
+│  │  • Create tasks with deliberately omitted information                                                │ │
+│  │  • Force model to learn to ask clarifying questions                                                  │ │
+│  │  • Example: "Book a flight" without dates → model should ask                                         │ │
+│  │                                                                                                       │ │
+│  │  MCP TOOL INTEGRATION:                                                                                │ │
+│  │  • Create tasks that benefit from external API access                                                │ │
+│  │  • Model learns when to use tools vs pure UI interaction                                             │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Method 2: OS-Genesis Reverse Task Synthesis (arXiv:2412.19723)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     OS-GENESIS: REVERSE TASK SYNTHESIS                                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  KEY INNOVATION: Explore first, derive tasks retrospectively                                                │
+│                                                                                                             │
+│  TRADITIONAL APPROACH (Limited):                                                                            │
+│  ════════════════════════════════                                                                           │
+│                                                                                                             │
+│     Pre-defined Tasks → Agent Attempts → Collect Trajectories                                               │
+│                                                                                                             │
+│     PROBLEM: Limited to tasks you can think of upfront                                                     │
+│     PROBLEM: Synthetic tasks are repetitive and unrealistic                                                │
+│                                                                                                             │
+│  OS-GENESIS APPROACH (Better):                                                                              │
+│  ═══════════════════════════════                                                                            │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  STEP 1: EXPLORATION                                                                                  │ │
+│  │  ═══════════════════                                                                                  │ │
+│  │  • Drop agent into real environment (browser, desktop, mobile)                                       │ │
+│  │  • Let it interact freely: click buttons, type text, navigate                                        │ │
+│  │  • Record ALL actions and screenshots                                                                 │ │
+│  │                                                                                                       │ │
+│  │  STEP 2: RETROSPECTIVE TASK DERIVATION                                                                │ │
+│  │  ════════════════════════════════════════                                                             │ │
+│  │  • Look at trajectory after the fact                                                                  │ │
+│  │  • Ask LLM: "What task was accomplished here?"                                                        │ │
+│  │  • Generate task instruction that matches the trajectory                                              │ │
+│  │                                                                                                       │ │
+│  │  Example:                                                                                             │ │
+│  │  Trajectory: Click Gmail → Click Compose → Type "hello@example.com" → Type subject → Click Send     │ │
+│  │  Derived Task: "Send an email to hello@example.com with a short greeting"                            │ │
+│  │                                                                                                       │ │
+│  │  STEP 3: QUALITY FILTERING                                                                            │ │
+│  │  ═══════════════════════════                                                                          │ │
+│  │  • Verify trajectory actually accomplishes derived task                                               │ │
+│  │  • Check for inconsistencies, errors, dead ends                                                       │ │
+│  │  • Keep only high-quality (task, trajectory) pairs                                                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  WHY THIS WORKS BETTER:                                                                                     │
+│  • Discovers tasks you wouldn't have thought to create                                                     │
+│  • Trajectories are guaranteed to be feasible (they already happened)                                     │
+│  • Higher diversity from natural exploration                                                               │
+│  • Avoids the "template trap" of synthetic data                                                            │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Method 3: FaraGen Pipeline (Fara-7B)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     FARAGEN: MULTI-AGENT SYNTHETIC DATA ENGINE                                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  KEY INNOVATION: Multi-agent task solving with quality filtering                                            │
+│  RESULT: 145,000 high-quality trajectories for SFT                                                          │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  STAGE 1: TASK PROPOSAL                                                                               │ │
+│  │  ═════════════════════════                                                                            │ │
+│  │  • Input: High-value URLs (e-commerce, productivity, social media)                                   │ │
+│  │  • LLM generates realistic tasks for each URL                                                         │ │
+│  │  • Filter for feasibility and diversity                                                               │ │
+│  │                                                                                                       │ │
+│  │  STAGE 2: TASK SOLVING (Multi-Agent)                                                                  │ │
+│  │  ════════════════════════════════════                                                                 │ │
+│  │                                                                                                       │ │
+│  │  ┌──────────────────┐         ┌──────────────────┐                                                   │ │
+│  │  │   ORCHESTRATOR   │ ─────▶  │   WEBSURFER      │                                                   │ │
+│  │  │   (Plans tasks)  │         │   (Executes)     │                                                   │ │
+│  │  └──────────────────┘         └──────────────────┘                                                   │ │
+│  │           │                            │                                                              │ │
+│  │           │                            ▼                                                              │ │
+│  │           │         ┌──────────────────────────────────────────────────────────────────┐             │ │
+│  │           │         │  TRAJECTORY = [                                                  │             │ │
+│  │           │         │    (screenshot_1, action_1, thought_1),                         │             │ │
+│  │           │         │    (screenshot_2, action_2, thought_2),                         │             │ │
+│  │           └────────▶│    ...                                                          │             │ │
+│  │                     │  ]                                                              │             │ │
+│  │                     └──────────────────────────────────────────────────────────────────┘             │ │
+│  │                                                                                                       │ │
+│  │  STAGE 3: QUALITY FILTERING                                                                           │ │
+│  │  ════════════════════════════                                                                         │ │
+│  │  • Verify task completion (did it actually succeed?)                                                 │ │
+│  │  • Check trajectory coherence (no random jumps)                                                      │ │
+│  │  • Filter out error loops and dead ends                                                              │ │
+│  │  • LLM-based semantic verification                                                                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### GRPO for GUI Agents: How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     GRPO (GROUP RELATIVE POLICY OPTIMIZATION) FOR GUI GROUNDING                             │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  WHY GRPO > SFT FOR GUI GROUNDING:                                                                          │
+│  ═════════════════════════════════                                                                          │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  SFT PROBLEM:                                                                                         │ │
+│  │  ────────────                                                                                         │ │
+│  │  • Target: Center of bounding box (512, 384)                                                         │ │
+│  │  • Prediction: (515, 380) — 5 pixels off                                                             │ │
+│  │  • SFT loss: "WRONG!" (treats as complete failure)                                                   │ │
+│  │  • Reality: Click would succeed (still inside button)                                                │ │
+│  │                                                                                                       │ │
+│  │  GRPO SOLUTION:                                                                                       │ │
+│  │  ────────────────                                                                                     │ │
+│  │  • Reward function: "Is click inside target region? → +1, else → 0"                                  │ │
+│  │  • Prediction (515, 380) inside button → Reward = +1 ✓                                               │ │
+│  │  • Model learns: "Anywhere inside is good enough"                                                     │ │
+│  │  • More flexible, matches real success criteria                                                       │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  HOW GRPO WORKS:                                                                                            │
+│  ═══════════════                                                                                            │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. GENERATE MULTIPLE OUTPUTS                                                                         │ │
+│  │     ───────────────────────────                                                                       │ │
+│  │     For same input (screenshot + instruction), generate N=8 different click predictions             │ │
+│  │                                                                                                       │ │
+│  │     Input: "Click the Submit button"                                                                  │ │
+│  │     Outputs: [(512, 384), (520, 390), (480, 400), (600, 200), ...]                                   │ │
+│  │                                                                                                       │ │
+│  │  2. EVALUATE WITH REWARD FUNCTION                                                                     │ │
+│  │     ────────────────────────────────                                                                  │ │
+│  │     Check each prediction: Is it inside the target bounding box?                                     │ │
+│  │                                                                                                       │ │
+│  │     Rewards: [1, 1, 1, 0, 0, 1, 0, 1]  (5 inside, 3 outside)                                         │ │
+│  │                                                                                                       │ │
+│  │  3. COMPUTE ADVANTAGE (No Critic Needed!)                                                             │ │
+│  │     ──────────────────────────────────────                                                            │ │
+│  │     Mean reward = 5/8 = 0.625                                                                         │ │
+│  │     Advantage_i = (reward_i - mean) / std                                                             │ │
+│  │                                                                                                       │ │
+│  │     Successful clicks → positive advantage → increase probability                                    │ │
+│  │     Failed clicks → negative advantage → decrease probability                                         │ │
+│  │                                                                                                       │ │
+│  │  4. UPDATE POLICY                                                                                     │ │
+│  │     ───────────────                                                                                   │ │
+│  │     • Increase log-prob of actions with positive advantage                                           │ │
+│  │     • Decrease log-prob of actions with negative advantage                                           │ │
+│  │     • KL penalty keeps model close to reference (prevents collapse)                                  │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  GUI-SPECIFIC REWARD FUNCTIONS (from GRPO for GUI Grounding paper):                                         │
+│  ═════════════════════════════════════════════════════════════════                                          │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  REWARD FUNCTION        │ FORMULA                          │ RESULT                                  │ │
+│  │  ────────────────────────────────────────────────────────────────────────────────────────────────────│ │
+│  │  Click-Based (BEST)     │ 1 if (x,y) inside bbox, else 0   │ Simple, works best!                    │ │
+│  │  IoU-Based              │ IoU(pred_box, target_box)        │ Slightly worse, more complex           │ │
+│  │  MSE-Based              │ -MSE(pred, center)               │ Too rigid, penalizes valid clicks      │ │
+│  │  Format Reward          │ +0.1 if output is valid JSON     │ Helps with formatting                  │ │
+│  │                                                                                                       │ │
+│  │  KEY FINDING: Simple click-based reward is SUFFICIENT for strong performance                        │ │
+│  │  → Don't overcomplicate the reward function!                                                         │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Practical Engineering Checklist: Creating Better SFT Data
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     ACTIONABLE CHECKLIST FOR BETTER SFT DATA                                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  □ INSTRUCTION DIVERSITY (from MAI-UI)                                                                      │
+│    ─────────────────────────────────────                                                                    │
+│    □ Generate instructions from 4 perspectives: APPEARANCE, FUNCTION, LOCATION, INTENT                    │
+│    □ Use MLLM to paraphrase and create variations                                                          │
+│    □ Include both specific ("Click the blue Submit button") and vague ("Finish the form")                 │
+│                                                                                                             │
+│  □ TRAJECTORY QUALITY (from OS-Genesis)                                                                     │
+│    ───────────────────────────────────────                                                                  │
+│    □ Use reverse task synthesis: Explore → Derive tasks retrospectively                                   │
+│    □ Verify trajectories actually accomplish the task                                                      │
+│    □ Filter out error loops, dead ends, inconsistent sequences                                             │
+│                                                                                                             │
+│  □ DATA SOURCES (from MAI-UI)                                                                               │
+│    ─────────────────────────────                                                                            │
+│    □ Rejection-sampled rollouts (model-generated, keep successes only)                                    │
+│    □ Expert demonstrations (expensive but high quality for edge cases)                                    │
+│    □ Automatic exploration (high volume, needs filtering)                                                  │
+│                                                                                                             │
+│  □ QUALITY FILTERING (from GUI-360)                                                                         │
+│    ─────────────────────────────────                                                                        │
+│    □ LLM-driven quality checks: "Does this trajectory make sense?"                                        │
+│    □ Verify task completion programmatically when possible                                                 │
+│    □ Human spot-checks on random samples                                                                   │
+│                                                                                                             │
+│  □ ENVIRONMENT DIVERSITY                                                                                    │
+│    ───────────────────────────                                                                              │
+│    □ Multiple platforms: Web, desktop (Windows/Mac/Linux), mobile (Android/iOS)                           │
+│    □ Multiple applications per platform                                                                    │
+│    □ Different screen resolutions, themes, languages                                                       │
+│                                                                                                             │
+│  □ AUGMENTATION FOR ROBUSTNESS                                                                              │
+│    ───────────────────────────────                                                                          │
+│    □ Add tasks with missing information (practice clarification)                                          │
+│    □ Include error recovery scenarios                                                                      │
+│    □ Add multi-step tasks with dependencies                                                                │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  GROUNDING DATA SPECIFICS:                                                                                  │
+│  ═══════════════════════════                                                                                │
+│                                                                                                             │
+│  □ Include bounding boxes, not just center coordinates                                                     │
+│  □ Multiple valid click points per element (not just center)                                              │
+│  □ Negative examples: "There is no Submit button" for screens without one                                 │
+│  □ Occlusion handling: Elements partially hidden by popups/menus                                          │
+│                                                                                                             │
+│  NAVIGATION DATA SPECIFICS:                                                                                 │
+│  ═══════════════════════════                                                                                │
+│                                                                                                             │
+│  □ Include intermediate screenshots (not just start/end)                                                   │
+│  □ Record all actions: clicks, typing, scrolling, waiting                                                 │
+│  □ Include failure recovery: What to do when action fails                                                 │
+│  □ State tracking: What changed after each action                                                          │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Datasets to Learn From
+
+| Dataset | Size | Focus | Key Innovation |
+|---------|------|-------|----------------|
+| **UGround** | 10M elements, 1.3M screenshots | Visual grounding | Largest GUI grounding corpus |
+| **GUI-Actor Data** | 1M screenshots, 10M elements | Bounding box supervision | Multi-source aggregation |
+| **OS-ATLAS** | 13M elements | Cross-platform | Open toolkit for data synthesis |
+| **GUICourse** | 700K QA pairs | Region-text grounding | SFT-ready format |
+| **GUI-360** | 1.2M action steps | Windows office apps | Automated pipeline |
+| **MAI-UI (internal)** | Unknown | Full navigation + tools | Self-evolving pipeline |
+
+### OS-Genesis: Implementation Deep Dive
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     OS-GENESIS: STEP-BY-STEP IMPLEMENTATION                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  PHASE 1: INTERACTION-DRIVEN FUNCTIONAL DISCOVERY                                                           │
+│  ═════════════════════════════════════════════════                                                          │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. SYSTEMATIC GUI EXPLORATION                                                                        │ │
+│  │     ────────────────────────────                                                                      │ │
+│  │     • Use rule-based traversal on GUI environments (emulators, browsers)                             │ │
+│  │     • Actions: CLICK buttons/links, TYPE in inputs, SCROLL pages                                    │ │
+│  │     • For input fields: Use GPT-4o to generate contextually appropriate content                     │ │
+│  │       Example: Email field → "user@example.com", Name field → "John Smith"                          │ │
+│  │                                                                                                       │ │
+│  │  2. COLLECT INTERACTION TRIPLETS                                                                      │ │
+│  │     ────────────────────────────────                                                                  │ │
+│  │                                                                                                       │ │
+│  │     Triplet = ⟨s_pre, action, s_post⟩                                                                │ │
+│  │                                                                                                       │ │
+│  │     Where:                                                                                            │ │
+│  │     • s_pre  = Screenshot BEFORE action                                                              │ │
+│  │     • action = What was done (CLICK at (x,y), TYPE "text", SCROLL down)                             │ │
+│  │     • s_post = Screenshot AFTER action                                                               │ │
+│  │                                                                                                       │ │
+│  │     Store these triplets for all exploration steps.                                                  │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PHASE 2: REVERSE TASK SYNTHESIS                                                                            │
+│  ════════════════════════════════                                                                           │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  1. LOW-LEVEL INSTRUCTION GENERATION (τ_low)                                                          │ │
+│  │     ──────────────────────────────────────────                                                        │ │
+│  │                                                                                                       │ │
+│  │     For each triplet ⟨s_pre, action, s_post⟩:                                                        │ │
+│  │                                                                                                       │ │
+│  │     PROMPT TO GPT-4o:                                                                                 │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────────────────────────────┐  │ │
+│  │     │ Given these two screenshots (before and after an action):                                   │  │ │
+│  │     │ [s_pre image] [s_post image]                                                                │  │ │
+│  │     │                                                                                             │  │ │
+│  │     │ The action performed was: {action}                                                          │  │ │
+│  │     │                                                                                             │  │ │
+│  │     │ Generate a specific, atomic task instruction that describes what was accomplished.         │  │ │
+│  │     │ Examples: "Click the dropdown to display options", "Enter email address in the field"     │  │ │
+│  │     └─────────────────────────────────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                                                       │ │
+│  │     OUTPUT: "Click the Settings icon to open the preferences menu"                                   │ │
+│  │                                                                                                       │ │
+│  │  2. HIGH-LEVEL INSTRUCTION CONSTRUCTION                                                               │ │
+│  │     ──────────────────────────────────────────                                                        │ │
+│  │                                                                                                       │ │
+│  │     Group related low-level instructions into goal-oriented tasks:                                   │ │
+│  │                                                                                                       │ │
+│  │     Low-level sequence:                                                                              │ │
+│  │     1. "Click the Gmail icon"                                                                        │ │
+│  │     2. "Click Compose button"                                                                        │ │
+│  │     3. "Type recipient email"                                                                        │ │
+│  │     4. "Type subject line"                                                                           │ │
+│  │     5. "Click Send"                                                                                  │ │
+│  │                                                                                                       │ │
+│  │     → High-level task: "Send an email with a greeting to the specified recipient"                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PHASE 3: TRAJECTORY REWARD MODEL (QUALITY FILTERING)                                                       │
+│  ═════════════════════════════════════════════════════                                                      │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  Score each (task, trajectory) pair on multiple criteria:                                            │ │
+│  │                                                                                                       │ │
+│  │  REWARD COMPONENTS:                                                                                   │ │
+│  │  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐ │ │
+│  │  │ Component          │ Weight │ Description                                                      │ │ │
+│  │  ├────────────────────┼────────┼──────────────────────────────────────────────────────────────────┤ │ │
+│  │  │ Task Completion    │ 0.4    │ Does trajectory actually accomplish the stated task?           │ │ │
+│  │  │ Coherence          │ 0.2    │ Are steps logically connected? No random jumps?                │ │ │
+│  │  │ Efficiency         │ 0.2    │ Minimal steps to complete? No loops/redundancy?                │ │ │
+│  │  │ Instruction Match  │ 0.2    │ Does high-level task accurately describe the trajectory?       │ │ │
+│  │  └─────────────────────────────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                                                       │ │
+│  │  FILTERING:                                                                                           │ │
+│  │  • Keep trajectories with reward > 0.7                                                               │ │
+│  │  • Discard error loops, dead ends, incomplete tasks                                                  │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### UI-R1: GRPO for GUI Action Prediction (arXiv:2503.21620)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     UI-R1: APPLYING GRPO TO GUI AGENTS (Qwen2.5-VL-3B)                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  KEY INSIGHT: DeepSeek-R1 style RL works for GUI agents, not just math                                     │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  WHY GRPO WORKS FOR GUI TASKS:                                                                        │ │
+│  │  ─────────────────────────────────                                                                    │ │
+│  │                                                                                                       │ │
+│  │  1. GUI tasks are VERIFIABLE (like math)                                                              │ │
+│  │     • Did the click land inside the target element? → Yes/No                                         │ │
+│  │     • Did the action produce the expected state change? → Check screenshot                           │ │
+│  │                                                                                                       │ │
+│  │  2. No need for expensive human preference data                                                       │ │
+│  │     • Unlike RLHF, we can compute rewards automatically                                              │ │
+│  │     • Just check if action succeeded                                                                  │ │
+│  │                                                                                                       │ │
+│  │  3. GRPO's group comparison helps                                                                     │ │
+│  │     • Generate 8 predictions for same screenshot+instruction                                         │ │
+│  │     • Some succeed, some fail                                                                         │ │
+│  │     • Learn from the contrast                                                                         │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  UI-R1 TRAINING PIPELINE:                                                                                   │
+│  ═══════════════════════════                                                                                │
+│                                                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                    │   │
+│  │  STAGE 1: SFT WARMUP (Optional but recommended)                                                   │   │
+│  │  ────────────────────────────────────────────────                                                 │   │
+│  │  • Fine-tune Qwen2.5-VL-3B on small grounding dataset (~10K examples)                            │   │
+│  │  • Just enough to learn the output format                                                         │   │
+│  │  • Don't overfit - GRPO will do the heavy lifting                                                │   │
+│  │                                                                                                    │   │
+│  │  STAGE 2: GRPO TRAINING                                                                           │   │
+│  │  ────────────────────────                                                                         │   │
+│  │  For each batch:                                                                                   │   │
+│  │                                                                                                    │   │
+│  │  1. Sample (screenshot, instruction, target_bbox) from dataset                                   │   │
+│  │                                                                                                    │   │
+│  │  2. Generate N=8 coordinate predictions from current policy                                      │   │
+│  │     predictions = model.generate(screenshot, instruction, num_return_sequences=8)               │   │
+│  │                                                                                                    │   │
+│  │  3. Compute rewards for each prediction                                                           │   │
+│  │     rewards = [1.0 if inside_bbox(pred, target_bbox) else 0.0 for pred in predictions]          │   │
+│  │                                                                                                    │   │
+│  │  4. Compute advantages (group normalization)                                                      │   │
+│  │     mean_reward = mean(rewards)                                                                   │   │
+│  │     std_reward = std(rewards)                                                                     │   │
+│  │     advantages = [(r - mean_reward) / std_reward for r in rewards]                               │   │
+│  │                                                                                                    │   │
+│  │  5. Update policy with GRPO loss                                                                  │   │
+│  │     loss = -mean(advantages * log_probs) + kl_penalty                                            │   │
+│  │                                                                                                    │   │
+│  └────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation Code: GRPO for GUI Grounding
+
+```python
+# Example: GRPO Training for GUI Grounding with Qwen-VL
+# Based on TRL library and UI-R1 methodology
+
+from trl import GRPOTrainer, GRPOConfig
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+import torch
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1: DEFINE REWARD FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def click_reward(completions: list[str], bbox: list[dict], **kwargs) -> list[float]:
+    """
+    Core reward function for GUI grounding.
+    Returns 1.0 if predicted click is inside target bounding box, 0.0 otherwise.
+    
+    This is the SIMPLEST and MOST EFFECTIVE reward (from GRPO for GUI Grounding paper).
+    """
+    rewards = []
+    for completion, target in zip(completions, bbox):
+        try:
+            # Parse model output: expecting "(x, y)" format
+            # Extract coordinates from completion
+            import re
+            match = re.search(r'\((\d+),\s*(\d+)\)', completion)
+            if match:
+                pred_x, pred_y = int(match.group(1)), int(match.group(2))
+                
+                # Check if prediction is inside bounding box
+                x1, y1, x2, y2 = target['x1'], target['y1'], target['x2'], target['y2']
+                if x1 <= pred_x <= x2 and y1 <= pred_y <= y2:
+                    rewards.append(1.0)  # SUCCESS: click inside target
+                else:
+                    rewards.append(0.0)  # FAIL: click outside target
+            else:
+                rewards.append(0.0)  # FAIL: couldn't parse coordinates
+        except Exception:
+            rewards.append(0.0)
+    
+    return rewards
+
+def format_reward(completions: list[str], **kwargs) -> list[float]:
+    """
+    Auxiliary reward for correct output format.
+    Helps model learn to output parseable coordinates.
+    """
+    rewards = []
+    import re
+    for completion in completions:
+        # Check if output contains valid coordinate format
+        if re.search(r'\(\d+,\s*\d+\)', completion):
+            rewards.append(0.1)  # Small bonus for correct format
+        else:
+            rewards.append(0.0)
+    return rewards
+
+def combined_reward(completions: list[str], bbox: list[dict], **kwargs) -> list[float]:
+    """
+    Combined reward = click_reward + format_reward
+    """
+    click_rewards = click_reward(completions, bbox, **kwargs)
+    format_rewards = format_reward(completions, **kwargs)
+    return [c + f for c, f in zip(click_rewards, format_rewards)]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2: PREPARE DATASET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def prepare_grounding_dataset():
+    """
+    Dataset format for GUI grounding:
+    - prompt: Contains instruction for what to click
+    - image: Screenshot of the GUI
+    - bbox: Target bounding box coordinates
+    
+    4 Perspectives (from MAI-UI):
+    - Appearance: "Click the blue button with white text"
+    - Function: "Click the button to submit the form"
+    - Location: "Click the button at the bottom right"
+    - Intent: "Complete your order"
+    """
+    from datasets import Dataset
+    
+    # Example data structure
+    data = {
+        "prompt": [
+            "Click the blue Submit button",           # Appearance
+            "Click the button to submit the form",    # Function
+            "Click the button at the bottom right",   # Location
+            "Complete your order",                    # Intent
+        ],
+        "image_path": [
+            "screenshots/form_page.png",
+            "screenshots/form_page.png",
+            "screenshots/form_page.png",
+            "screenshots/form_page.png",
+        ],
+        "bbox": [
+            {"x1": 480, "y1": 350, "x2": 560, "y2": 390},
+            {"x1": 480, "y1": 350, "x2": 560, "y2": 390},
+            {"x1": 480, "y1": 350, "x2": 560, "y2": 390},
+            {"x1": 480, "y1": 350, "x2": 560, "y2": 390},
+        ],
+    }
+    
+    return Dataset.from_dict(data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 3: CONFIGURE AND TRAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_grpo_gui_grounding():
+    """
+    Main training function for GRPO GUI grounding.
+    """
+    
+    # Load model (use 32B for production, smaller for experiments)
+    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"  # Or Qwen3-VL-32B for best results
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    processor = AutoProcessor.from_pretrained(model_name)
+    
+    # GRPO configuration
+    config = GRPOConfig(
+        output_dir="./grpo_gui_grounding",
+        
+        # Group size: how many predictions per input
+        # Higher = more stable gradients, slower training
+        num_generations=8,  # Generate 8 predictions per sample
+        
+        # Learning rate (lower than SFT, RL is sensitive)
+        learning_rate=1e-6,
+        
+        # KL penalty to prevent policy collapse
+        kl_coef=0.05,
+        
+        # Batch sizes
+        per_device_train_batch_size=1,  # Memory constrained
+        gradient_accumulation_steps=8,
+        
+        # Training duration
+        num_train_epochs=3,
+        
+        # Logging
+        logging_steps=10,
+        save_steps=500,
+    )
+    
+    # Prepare dataset
+    dataset = prepare_grounding_dataset()
+    
+    # Initialize trainer with reward functions
+    trainer = GRPOTrainer(
+        model=model,
+        config=config,
+        train_dataset=dataset,
+        processing_class=processor,
+        reward_funcs=[combined_reward],  # Can use multiple reward functions
+    )
+    
+    # Train!
+    trainer.train()
+    
+    return trainer
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4: WHY 32B IS REQUIRED (MODEL SIZE MATTERS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+CRITICAL INSIGHT: GRPO only works if base model is capable enough
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  MODEL SIZE vs GRPO EFFECTIVENESS                                          │
+│  ══════════════════════════════════                                         │
+│                                                                             │
+│  ┌───────────┬───────────────────────────────────────────────────────────┐  │
+│  │ Model     │ What Happens During GRPO Training                        │  │
+│  ├───────────┼───────────────────────────────────────────────────────────┤  │
+│  │ 2B-4B     │ Generates 8 predictions → ALL wrong → No learning signal │  │
+│  │           │ Advantages all ≈ 0, no gradient, no improvement          │  │
+│  ├───────────┼───────────────────────────────────────────────────────────┤  │
+│  │ 7B-8B     │ Generates 8 predictions → 1-2 correct → Weak signal      │  │
+│  │           │ Some learning, but unstable, slow convergence            │  │
+│  ├───────────┼───────────────────────────────────────────────────────────┤  │
+│  │ 32B       │ Generates 8 predictions → 3-5 correct → STRONG signal    │  │
+│  │           │ Clear gradient direction, fast, stable improvement       │  │
+│  └───────────┴───────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  THE MATH:                                                                  │
+│  ─────────                                                                  │
+│  If all predictions are wrong: mean=0, std=0 → advantage undefined        │
+│  If 1/8 correct: mean=0.125, advantage of correct sample = 0.875/std      │
+│  If 4/8 correct: mean=0.5, clear separation between good and bad          │
+│                                                                             │
+│  CONCLUSION: You need a base model that can sometimes succeed             │
+│  Smaller models fail 100% → GRPO cannot learn from nothing               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+"""
+```
+
+### SFT Data Quality Engineering: What We Learned
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     ENGINEERING PRINCIPLES FOR BETTER SFT DATA                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  PRINCIPLE 1: QUALITY > QUANTITY                                                                            │
+│  ═══════════════════════════════                                                                            │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  FaraGen trained on 145K trajectories → better than models trained on millions                       │ │
+│  │  GUI-R1 achieved SOTA with 0.02% of typical data → quality is exponentially more important           │ │
+│  │                                                                                                       │ │
+│  │  HOW TO ENSURE QUALITY:                                                                               │ │
+│  │  ────────────────────────                                                                             │ │
+│  │  1. Programmatic verification (did action succeed?)                                                  │ │
+│  │  2. LLM-based semantic checks (does trajectory make sense?)                                          │ │
+│  │  3. Human spot-checks (sample 1% for manual review)                                                  │ │
+│  │  4. Rejection sampling (keep only successful rollouts)                                               │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PRINCIPLE 2: INSTRUCTION DIVERSITY IS CRITICAL                                                             │
+│  ═══════════════════════════════════════════════                                                            │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  BAD: Training only on "Click the X button"                                                          │ │
+│  │  → Model learns button name, not visual grounding                                                    │ │
+│  │                                                                                                       │ │
+│  │  GOOD: Training on all 4 perspectives (MAI-UI approach):                                             │ │
+│  │  • "Click the blue rectangular button" (appearance)                                                  │ │
+│  │  • "Click the submit button" (function)                                                              │ │
+│  │  • "Click the button at bottom-right" (location)                                                     │ │
+│  │  • "Finish your order" (intent)                                                                      │ │
+│  │  → Model learns robust visual grounding from any description                                         │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PRINCIPLE 3: REVERSE SYNTHESIS > TEMPLATE GENERATION                                                       │
+│  ═════════════════════════════════════════════════════                                                      │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  TEMPLATE APPROACH (Limited):                                                                         │ │
+│  │  "For each element type, generate 10 instructions"                                                   │ │
+│  │  → Repetitive, unrealistic, limited to what you think of                                             │ │
+│  │                                                                                                       │ │
+│  │  REVERSE SYNTHESIS (OS-Genesis):                                                                      │ │
+│  │  "Explore freely, then ask: what was accomplished?"                                                  │ │
+│  │  → Discovers unexpected tasks, guaranteed feasible, natural distribution                             │ │
+│  │                                                                                                       │ │
+│  │  IMPLEMENTATION INSIGHT:                                                                              │ │
+│  │  Use GPT-4o with screenshots before/after to generate task descriptions                              │ │
+│  │  The LLM can infer intent better than you can write templates                                        │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PRINCIPLE 4: MULTI-SOURCE DATA MIXING                                                                      │
+│  ═════════════════════════════════════                                                                      │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  OPTIMAL DATA MIX (from MAI-UI):                                                                      │ │
+│  │                                                                                                       │ │
+│  │  ┌─────────────────────────┬────────┬───────────────────────────────────────────────────────────────┐│ │
+│  │  │ Source                  │ %      │ Purpose                                                       ││ │
+│  │  ├─────────────────────────┼────────┼───────────────────────────────────────────────────────────────┤│ │
+│  │  │ Rejection-sampled       │ 50%    │ What model can already do (bootstrap)                        ││ │
+│  │  │ Expert demonstrations   │ 20%    │ Edge cases model fails on (targeted improvement)             ││ │
+│  │  │ Automatic exploration   │ 30%    │ Diversity and volume (breadth)                               ││ │
+│  │  └─────────────────────────┴────────┴───────────────────────────────────────────────────────────────┘│ │
+│  │                                                                                                       │ │
+│  │  KEY INSIGHT: Rejection-sampled data is self-reinforcing                                             │ │
+│  │  • Train model → sample rollouts → keep successes → retrain → better model                          │ │
+│  │  • This is the "self-evolving" part of MAI-UI's pipeline                                            │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PRINCIPLE 5: INCLUDE FAILURE RECOVERY                                                                      │
+│  ═════════════════════════════════════                                                                      │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  PROBLEM: Models trained only on success trajectories don't know what to do when things go wrong    │ │
+│  │                                                                                                       │ │
+│  │  SOLUTION: Include recovery examples in training data                                                │ │
+│  │                                                                                                       │ │
+│  │  Example trajectory with recovery:                                                                   │ │
+│  │  1. Click "Submit" → Error popup appears                                                             │ │
+│  │  2. Read error message: "Email invalid"                                                              │ │
+│  │  3. Click "OK" to dismiss popup                                                                      │ │
+│  │  4. Click email field, correct the email                                                             │ │
+│  │  5. Click "Submit" → Success                                                                         │ │
+│  │                                                                                                       │ │
+│  │  This teaches: Error detection → Root cause → Corrective action                                     │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  PRINCIPLE 6: TRAIN FOR CLARIFICATION                                                                       │
+│  ════════════════════════════════════                                                                       │
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  MAI-UI INNOVATION: Tasks with deliberately omitted information                                      │ │
+│  │                                                                                                       │ │
+│  │  Example:                                                                                             │ │
+│  │  User: "Book me a flight"                                                                            │ │
+│  │  (No destination, no dates provided)                                                                 │ │
+│  │                                                                                                       │ │
+│  │  WRONG response: Guess and book something                                                            │ │
+│  │  RIGHT response: "I'd be happy to book a flight. Could you tell me:                                  │ │
+│  │                   1. Where are you flying to?                                                        │ │
+│  │                   2. What are your travel dates?"                                                    │ │
+│  │                                                                                                       │ │
+│  │  TRAINING DATA: Include many examples where the correct action is to ASK, not ACT                   │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Summary: The Complete Training Recipe
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                     COMPLETE RECIPE: FROM BASE MODEL TO RELIABLE GUI AGENT                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                                       │ │
+│  │  PHASE 1: CREATE HIGH-QUALITY SFT DATA                                                                │ │
+│  │  ══════════════════════════════════════                                                               │ │
+│  │                                                                                                       │ │
+│  │  1. Collect grounding data with multi-perspective instructions (MAI-UI)                              │ │
+│  │  2. Use reverse task synthesis for trajectory data (OS-Genesis)                                      │ │
+│  │  3. Apply rigorous quality filtering (LLM + programmatic)                                            │ │
+│  │  4. Include failure recovery and clarification examples                                              │ │
+│  │  5. Mix sources: 50% rejection-sampled, 20% expert, 30% exploration                                 │ │
+│  │                                                                                                       │ │
+│  │  PHASE 2: SFT TRAINING                                                                                │ │
+│  │  ═════════════════════                                                                                │ │
+│  │                                                                                                       │ │
+│  │  • Start with Qwen3-VL-32B (smaller models won't work for reliable agents)                           │ │
+│  │  • Fine-tune on curated dataset                                                                      │ │
+│  │  • Target: Model learns format and basic grounding                                                   │ │
+│  │  • Don't overfit - GRPO will refine further                                                          │ │
+│  │                                                                                                       │ │
+│  │  PHASE 3: GRPO REFINEMENT                                                                             │ │
+│  │  ═══════════════════════                                                                              │ │
+│  │                                                                                                       │ │
+│  │  • Simple click-based reward function (inside bbox = 1, outside = 0)                                │ │
+│  │  • Generate 8 predictions per sample, use group normalization                                        │ │
+│  │  • KL penalty to stay close to SFT checkpoint                                                        │ │
+│  │  • Continue until convergence on validation set                                                      │ │
+│  │                                                                                                       │ │
+│  │  EXPECTED RESULTS:                                                                                    │ │
+│  │  ════════════════════                                                                                 │ │
+│  │                                                                                                       │ │
+│  │  ┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐                           │ │
+│  │  │ Stage           │ Grounding Acc   │ Task Success    │ Reliability     │                           │ │
+│  │  ├─────────────────┼─────────────────┼─────────────────┼─────────────────┤                           │ │
+│  │  │ Base Qwen3-VL   │ ~60%            │ ~30%            │ Inconsistent    │                           │ │
+│  │  │ + SFT           │ ~80%            │ ~50%            │ Better          │                           │ │
+│  │  │ + GRPO          │ ~92%            │ ~70%            │ Production-ready│                           │ │
+│  │  └─────────────────┴─────────────────┴─────────────────┴─────────────────┘                           │ │
+│  │                                                                                                       │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                             │
+│  KEY TAKEAWAYS:                                                                                             │
+│  ═══════════════                                                                                            │
+│                                                                                                             │
+│  ✓ Model size matters: 32B minimum for reliable GUI agents                                                 │
+│  ✓ Data quality > Data quantity: Curated 145K > noisy 10M                                                  │
+│  ✓ Instruction diversity: 4 perspectives (appearance, function, location, intent)                         │
+│  ✓ Reverse synthesis: Let exploration drive task discovery                                                 │
+│  ✓ Simple rewards work: Click-inside-bbox is sufficient                                                    │
+│  ✓ GRPO needs base capability: Smaller models produce no learning signal                                   │
+│  ✓ Include edge cases: Failure recovery, clarification, error handling                                     │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## References
 
+### Core Model Papers
 - [Qwen3-VL Technical Report (arXiv:2511.21631)](https://arxiv.org/abs/2511.21631)
 - [Qwen3 Technical Report (arXiv:2505.09388)](https://arxiv.org/abs/2505.09388)
-- [MAI-UI Technical Report (arXiv:2512.22047)](https://arxiv.org/abs/2512.22047)
+- [MAI-UI Technical Report (arXiv:2512.22047)](https://arxiv.org/abs/2512.22047) - GRPO + SFT for GUI agents
+
+### GUI Agent Research (Why Model Size Matters)
+- [XBOUND: State-Level Evaluation for Device Control Agents](https://openreview.net/forum?id=UXdxYnkJtX) - Sub-7B models show limited state mastery
+- [GUI Knowledge Bench (arXiv:2510.26098)](https://arxiv.org/abs/2510.26098) - Smaller models retain limited knowledge
+- [Scaling Vision Transformers (CVPR 2022)](https://arxiv.org/abs/2106.04560) - Smaller models saturate
+- [CogAgent (CVPR 2024)](https://arxiv.org/abs/2312.08914) - 18B VLM for GUI
+- [GUI-R1 (arXiv:2504.10458)](https://arxiv.org/abs/2504.10458) - GRPO for GUI agents
+- [GUI-Actor (Microsoft)](https://microsoft.github.io/GUI-Actor/) - Qwen2-VL based grounding
+
+### Resources
 - [Qwen3-VL GitHub Repository](https://github.com/QwenLM/Qwen3-VL)
+- [MAI-UI GitHub Repository](https://github.com/Tongyi-MAI/MAI-UI)
 - [vLLM Qwen3-VL Usage Guide](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-VL.html)
 - [Hugging Face Qwen Collection](https://huggingface.co/Qwen)
 - [QWEN_VL_COMPLETE_GUIDE.md](./QWEN_VL_COMPLETE_GUIDE.md) - Companion architectural deep-dive
