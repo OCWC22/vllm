@@ -9,15 +9,22 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
 ## Table of Contents
 
 1. [Quick Reference: Model Selection by GPU](#quick-reference-model-selection-by-gpu)
-2. [All Qwen3-VL Models: Architecture Breakdown](#all-qwen3-vl-models-architecture-breakdown)
-3. [Qwen3 vs Qwen3-VL: Text-Only vs Multimodal](#qwen3-vs-qwen3-vl-text-only-vs-multimodal)
-4. [Complete Architecture Diagrams](#complete-architecture-diagrams)
-5. [vLLM PagedAttention for Multimodal](#vllm-pagedattention-for-multimodal)
-6. [GPU Memory Layout Diagrams](#gpu-memory-layout-diagrams)
-7. [vLLM Deployment Configurations](#vllm-deployment-configurations)
-8. [Performance Benchmarks](#performance-benchmarks)
-9. [Summary: Model Selection Guide](#summary-model-selection-guide)
-10. [References](#references)
+2. [**Engineering Guide: Model Selection & Deployment**](#engineering-guide-model-selection--deployment)
+   - [What Each Model Size Is Designed For](#what-each-model-size-is-designed-for)
+   - [Dense vs MoE: Architecture Deep Dive](#dense-vs-moe-architecture-deep-dive)
+   - [MoE Internal Mechanics](#moe-internal-mechanics-routing-experts-activation)
+   - [Performance/Cost/Latency Trade-offs](#performancecostlatency-trade-offs)
+   - [Production Scenario Decision Tree](#production-scenario-decision-tree)
+   - [Implementation & Deployment Guide](#implementation--deployment-guide)
+3. [All Qwen3-VL Models: Architecture Breakdown](#all-qwen3-vl-models-architecture-breakdown)
+4. [Qwen3 vs Qwen3-VL: Text-Only vs Multimodal](#qwen3-vs-qwen3-vl-text-only-vs-multimodal)
+5. [Complete Architecture Diagrams](#complete-architecture-diagrams)
+6. [vLLM PagedAttention for Multimodal](#vllm-pagedattention-for-multimodal)
+7. [GPU Memory Layout Diagrams](#gpu-memory-layout-diagrams)
+8. [vLLM Deployment Configurations](#vllm-deployment-configurations)
+9. [Performance Benchmarks](#performance-benchmarks)
+10. [Summary: Model Selection Guide](#summary-model-selection-guide)
+11. [References](#references)
 
 ---
 
@@ -59,6 +66,732 @@ All Qwen3-VL model sizes, their architecture, parameter counts, and optimal GPU 
 │  8×B200       1.5 TB    Qwen3-VL-235B-A22B      BF16        256K          128          ~200ms             │
 │                                                                                                            │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Engineering Guide: Model Selection & Deployment
+
+This section provides practical engineering guidance for choosing and deploying Qwen3-VL models in production.
+
+### What Each Model Size Is Designed For
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              QWEN3-VL MODEL DESIGN PURPOSES                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  DENSE MODELS (All parameters active for every token):                                                      │
+│  ═══════════════════════════════════════════════════════                                                    │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-2B (1.7B actual)                                                                           │   │
+│  │ ══════════════════════════                                                                          │   │
+│  │ PURPOSE: Edge deployment, mobile apps, cost-sensitive high-volume scenarios                        │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • Real-time mobile image captioning                                                                 │   │
+│  │ • IoT and embedded vision systems (Jetson, mobile chips)                                           │   │
+│  │ • High-throughput pipelines where latency matters more than accuracy                               │   │
+│  │ • Student/distillation teacher for smaller models                                                   │   │
+│  │ • Prototyping and development (fast iteration)                                                      │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: Lower accuracy on complex reasoning, fine details, multi-step instructions             │   │
+│  │ SWEET SPOT: Simple tasks (OCR, basic VQA, single-object detection) at <100ms latency              │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-4B                                                                                         │   │
+│  │ ════════════                                                                                        │   │
+│  │ PURPOSE: Balanced edge/cloud, consumer GPU deployment, cost-effective production                   │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • Consumer GPU inference (RTX 3090, RTX 4090)                                                       │   │
+│  │ • Document understanding (invoices, forms, receipts)                                                │   │
+│  │ • Basic GUI automation (MAI-UI on constrained hardware)                                             │   │
+│  │ • Multi-turn image conversations with reasonable context                                            │   │
+│  │ • Batch processing pipelines with throughput requirements                                           │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: Struggles with very complex diagrams, long documents, subtle visual details             │   │
+│  │ SWEET SPOT: Document processing, basic visual reasoning at 10-50 req/sec on single L4/T4          │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-8B                                                                                         │   │
+│  │ ════════════                                                                                        │   │
+│  │ PURPOSE: Production workhorse, best quality-to-cost ratio, recommended default choice              │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • General-purpose visual AI assistant                                                               │   │
+│  │ • Complex document understanding (multi-page, tables, charts)                                       │   │
+│  │ • Video understanding (short clips, surveillance, content moderation)                               │   │
+│  │ • GUI automation agents (MAI-UI primary target)                                                     │   │
+│  │ • Visual reasoning and multi-step problem solving                                                   │   │
+│  │ • Production APIs serving diverse visual tasks                                                      │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: Needs A100-class GPU for optimal performance                                            │   │
+│  │ SWEET SPOT: The "GPT-4V killer" for most visual tasks at 1/10th the cost                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-32B                                                                                        │   │
+│  │ ═════════════                                                                                       │   │
+│  │ PURPOSE: State-of-the-art quality, complex reasoning, when accuracy is paramount                   │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • Scientific/medical image analysis requiring high accuracy                                         │   │
+│  │ • Complex diagram understanding (architecture, circuit, engineering drawings)                       │   │
+│  │ • Long-form video analysis (movies, lectures, presentations)                                        │   │
+│  │ • Multi-image reasoning (compare, contrast, aggregate information)                                  │   │
+│  │ • Tasks where 8B isn't accurate enough                                                              │   │
+│  │ • Benchmark/evaluation workloads                                                                    │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: 4× memory, 2× latency vs 8B; diminishing returns on simple tasks                        │   │
+│  │ SWEET SPOT: High-stakes applications where wrong answers are costly                                │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  MoE MODELS (Mixture of Experts - sparse activation):                                                       │
+│  ═══════════════════════════════════════════════════════                                                    │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-30B-A3B (30B total, 3B active)                                                             │   │
+│  │ ═════════════════════════════════════════                                                           │   │
+│  │ PURPOSE: High capacity with 8B-like compute cost, best throughput for mixed workloads              │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • High-throughput production serving diverse query types                                            │   │
+│  │ • When you need 32B-like knowledge but 8B-like latency                                              │   │
+│  │ • Mixed workload APIs (some queries simple, some complex)                                           │   │
+│  │ • Cost optimization when GPU is the bottleneck                                                      │   │
+│  │ • Fitting "larger model knowledge" in limited compute budget                                        │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: Needs all 30B params in memory, but only computes with 3B                               │   │
+│  │ SWEET SPOT: Production APIs prioritizing throughput over single-request latency                    │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Qwen3-VL-235B-A22B (235B total, 22B active)                                                         │   │
+│  │ ════════════════════════════════════════════                                                        │   │
+│  │ PURPOSE: Frontier-class capability, research, when nothing else is good enough                     │   │
+│  │                                                                                                     │   │
+│  │ DESIGNED FOR:                                                                                       │   │
+│  │ • State-of-the-art visual reasoning benchmarks                                                      │   │
+│  │ • Complex agentic workflows requiring deep understanding                                            │   │
+│  │ • Research and capability exploration                                                               │   │
+│  │ • Enterprise applications with multi-GPU infrastructure                                             │   │
+│  │ • Tasks where 32B isn't accurate enough                                                             │   │
+│  │                                                                                                     │   │
+│  │ TRADE-OFF: Requires 8×H100 or 3×B200 minimum; high operational cost                                │   │
+│  │ SWEET SPOT: "Money is no object, we need the best accuracy possible"                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Dense vs MoE: Architecture Deep Dive
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              DENSE vs MoE ARCHITECTURE COMPARISON                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  FUNDAMENTAL DIFFERENCE:                                                                                    │
+│  ═══════════════════════                                                                                    │
+│                                                                                                             │
+│  Dense Model (e.g., Qwen3-VL-8B):                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │   Input Token ──▶ [ATTENTION] ──▶ [SINGLE MLP] ──▶ Output                                          │   │
+│  │                                    ════════════                                                     │   │
+│  │                                    ALL 8B params                                                    │   │
+│  │                                    used every time                                                  │   │
+│  │                                                                                                     │   │
+│  │   Every token activates the same MLP weights                                                        │   │
+│  │   Compute cost: O(hidden_size × intermediate_size) per token                                       │   │
+│  │   For 8B: hidden=4096, intermediate=24576 → 100M FLOPs/token in MLP                                │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  MoE Model (e.g., Qwen3-VL-30B-A3B):                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │   Input Token ──▶ [ATTENTION] ──▶ [ROUTER] ──▶ Select top-K ──▶ [K EXPERTS] ──▶ Weighted Sum       │   │
+│  │                                    ════════    out of 128        ════════════                       │   │
+│  │                                    Small MLP   experts           Only K experts                     │   │
+│  │                                    (gating)    (K=8)             compute!                           │   │
+│  │                                                                                                     │   │
+│  │   Each token only activates K=8 of 128 experts                                                      │   │
+│  │   Compute cost: O(K × expert_size) = 8/128 = 6.25% of full model                                   │   │
+│  │   For 30B-A3B: Only 3B params active per token → 30M FLOPs/token in MLP                            │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  WHY MoE?                                                                                                   │
+│  ════════                                                                                                   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  PROBLEM MoE SOLVES:                                                                                │   │
+│  │  ─────────────────────                                                                              │   │
+│  │  • Scaling dense models: 2× params = 2× compute = 2× cost                                          │   │
+│  │  • Memory bandwidth bound: GPUs can't feed data fast enough to utilize compute                     │   │
+│  │  • Different tokens need different "knowledge" but dense forces same path                          │   │
+│  │                                                                                                     │   │
+│  │  MOE SOLUTION:                                                                                      │   │
+│  │  ─────────────                                                                                      │   │
+│  │  • Store 10× more parameters (knowledge)                                                            │   │
+│  │  • Only activate the parameters relevant to each token                                              │   │
+│  │  • Result: More knowledge, similar compute cost                                                     │   │
+│  │                                                                                                     │   │
+│  │  ANALOGY:                                                                                           │   │
+│  │  Dense = One doctor who knows everything, answers every question                                   │   │
+│  │  MoE = Hospital with 128 specialist doctors, receptionist routes to top-8 relevant specialists    │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  ENGINEERING TRADE-OFFS:                                                                                    │
+│  ═══════════════════════                                                                                    │
+│                                                                                                             │
+│  ┌───────────────────────┬──────────────────────────────┬──────────────────────────────────────────────┐   │
+│  │ Aspect                │ Dense (8B)                   │ MoE (30B-A3B)                                │   │
+│  ├───────────────────────┼──────────────────────────────┼──────────────────────────────────────────────┤   │
+│  │ Memory (weights)      │ 16 GB (BF16)                 │ 60 GB (BF16) - 3.75× more                   │   │
+│  │ Compute per token     │ 16 GFLOPs                    │ 6 GFLOPs - 2.7× less                        │   │
+│  │ Memory bandwidth      │ Lower (read all weights)     │ Higher (sparse reads to 8 experts)         │   │
+│  │ Batching efficiency   │ Excellent (deterministic)    │ Variable (depends on routing)              │   │
+│  │ Implementation        │ Simple                       │ Complex (routing, load balancing)          │   │
+│  │ Latency (single req)  │ Predictable                  │ Slightly variable                          │   │
+│  │ Throughput (batched)  │ Good                         │ Excellent (less compute/token)             │   │
+│  │ Multi-GPU scaling     │ Straightforward              │ Requires expert parallelism                │   │
+│  └───────────────────────┴──────────────────────────────┴──────────────────────────────────────────────┘   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### MoE Internal Mechanics: Routing, Experts, Activation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              MoE ARCHITECTURE INTERNALS                                                      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  MoE LAYER EXECUTION FLOW (per transformer layer):                                                          │
+│  ═════════════════════════════════════════════════                                                          │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  STEP 1: ATTENTION (Same as Dense)                                                                  │   │
+│  │  ─────────────────────────────────                                                                  │   │
+│  │                                                                                                     │   │
+│  │     Input: [batch, seq_len, hidden_dim]                                                             │   │
+│  │        ↓                                                                                            │   │
+│  │  ┌──────────────────────────────┐                                                                   │   │
+│  │  │ Multi-Head Self-Attention   │ ← Same as dense model                                             │   │
+│  │  │ (GQA with 8 KV heads)       │                                                                   │   │
+│  │  └──────────────────────────────┘                                                                   │   │
+│  │        ↓                                                                                            │   │
+│  │     Output: [batch, seq_len, hidden_dim]                                                            │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  STEP 2: ROUTER (Gating Network)                                                                    │   │
+│  │  ───────────────────────────────                                                                    │   │
+│  │                                                                                                     │   │
+│  │     Input: hidden_states [batch × seq_len, hidden_dim]                                              │   │
+│  │                    ↓                                                                                │   │
+│  │     ┌────────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│  │     │ Router MLP: Linear(hidden_dim → num_experts)                                               │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │ For Qwen3-VL-30B-A3B:                                                                      │ │   │
+│  │     │ • hidden_dim = 4096                                                                        │ │   │
+│  │     │ • num_experts = 128                                                                        │ │   │
+│  │     │ • Router weights: 4096 × 128 = 524K parameters (tiny!)                                    │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │ logits = W_router @ hidden_states  # [batch×seq, 128]                                     │ │   │
+│  │     │ probs = softmax(logits)            # Expert probabilities                                 │ │   │
+│  │     │ top_k_weights, top_k_indices = topk(probs, k=8)  # Select top-8 experts                  │ │   │
+│  │     │ top_k_weights = top_k_weights / sum(top_k_weights)  # Renormalize                        │ │   │
+│  │     └────────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│  │                    ↓                                                                                │   │
+│  │     Output:                                                                                         │   │
+│  │     • routing_weights: [batch×seq, 8] - contribution of each selected expert                       │   │
+│  │     • expert_indices: [batch×seq, 8] - which 8 experts to use per token                            │   │
+│  │                                                                                                     │   │
+│  │     EXAMPLE for 1 token:                                                                            │   │
+│  │     ┌────────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│  │     │ Token: "The cat sat on the mat"[0] → "The"                                                 │ │   │
+│  │     │ Router output: Expert 12 (0.23), Expert 45 (0.18), Expert 7 (0.14), Expert 89 (0.12),     │ │   │
+│  │     │                Expert 34 (0.10), Expert 56 (0.09), Expert 23 (0.08), Expert 101 (0.06)    │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │ These 8 experts process "The", weighted sum gives final output                            │ │   │
+│  │     └────────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  STEP 3: EXPERT DISPATCH & COMPUTATION                                                              │   │
+│  │  ─────────────────────────────────────                                                              │   │
+│  │                                                                                                     │   │
+│  │     Each expert is a standard FFN (Feed-Forward Network):                                           │   │
+│  │     ┌────────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│  │     │ Expert_i(x) = SiLU(W_gate_i @ x) * (W_up_i @ x)   # gate_up projection                    │ │   │
+│  │     │ Expert_i(x) = W_down_i @ Expert_i(x)              # down projection                       │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │ For Qwen3-VL-30B-A3B:                                                                      │ │   │
+│  │     │ • W_gate, W_up: [hidden_dim, expert_intermediate] = [4096, ~1500] each                    │ │   │
+│  │     │ • W_down: [expert_intermediate, hidden_dim] = [~1500, 4096]                               │ │   │
+│  │     │ • Each expert: ~18M parameters                                                             │ │   │
+│  │     │ • 128 experts: 128 × 18M = 2.3B parameters (just in MoE layers)                           │ │   │
+│  │     └────────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                                                     │   │
+│  │     GPU EXECUTION:                                                                                  │   │
+│  │     ┌────────────────────────────────────────────────────────────────────────────────────────────┐ │   │
+│  │     │                                                                                            │ │   │
+│  │     │  Batch of 1024 tokens → Router selects 8 experts each → 8192 (token, expert) pairs       │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │  NAIVE: Loop over 8192 pairs sequentially (slow!)                                         │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │  OPTIMIZED (grouped GEMM):                                                                 │ │   │
+│  │     │  1. Group tokens by expert: Expert_12 gets [tok_0, tok_5, tok_23, ...]                    │ │   │
+│  │     │  2. Batch GEMM per expert: Expert_12(stacked_tokens)                                       │ │   │
+│  │     │  3. Scatter results back to original positions                                             │ │   │
+│  │     │                                                                                            │ │   │
+│  │     │  This is why MoE benefits from larger batches!                                             │ │   │
+│  │     │  More tokens → more tokens per expert → better GPU utilization                             │ │   │
+│  │     │                                                                                            │ │   │
+│  │     └────────────────────────────────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  STEP 4: WEIGHTED COMBINATION                                                                       │   │
+│  │  ────────────────────────────                                                                       │   │
+│  │                                                                                                     │   │
+│  │     For each token, combine the 8 expert outputs:                                                   │   │
+│  │                                                                                                     │   │
+│  │     output = Σ (routing_weight_i × expert_i_output)  for i in selected_8_experts                   │   │
+│  │                                                                                                     │   │
+│  │     EXAMPLE:                                                                                        │   │
+│  │     output = 0.23×Expert_12(x) + 0.18×Expert_45(x) + 0.14×Expert_7(x) + ...                        │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  LOAD BALANCING (Critical for Training, Matters for Inference):                                             │
+│  ═══════════════════════════════════════════════════════════════                                            │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │  PROBLEM: Some experts might be selected more than others                                           │   │
+│  │                                                                                                     │   │
+│  │  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐│   │
+│  │  │ Batch of 1024 tokens:                                                                          ││   │
+│  │  │ • Expert_12: 500 tokens (overloaded!)  → SM waiting, bottleneck                               ││   │
+│  │  │ • Expert_45: 50 tokens                 → SM underutilized                                      ││   │
+│  │  │ • Expert_7: 0 tokens                   → SM idle                                               ││   │
+│  │  │ ...                                                                                            ││   │
+│  │  └────────────────────────────────────────────────────────────────────────────────────────────────┘│   │
+│  │                                                                                                     │   │
+│  │  SOLUTIONS:                                                                                         │   │
+│  │  • Training: Auxiliary loss to encourage balanced expert usage                                      │   │
+│  │  • Inference: Expert capacity limits (drop tokens if expert too busy)                               │   │
+│  │  • Architecture: More experts + lower top-k (more uniform distribution)                            │   │
+│  │                                                                                                     │   │
+│  │  Qwen3-VL uses:                                                                                     │   │
+│  │  • 128 experts (high diversity)                                                                     │   │
+│  │  • Top-8 selection (each token uses 6.25% of experts)                                              │   │
+│  │  • Balanced training with load-balancing loss                                                       │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Performance/Cost/Latency Trade-offs
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PRACTICAL TRADE-OFF ANALYSIS                                                    │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  COST COMPARISON (estimated, on-demand cloud pricing):                                                      │
+│  ═════════════════════════════════════════════════════                                                      │
+│                                                                                                             │
+│  ┌──────────────────────┬─────────────┬────────────────┬───────────────┬─────────────────────────────────┐ │
+│  │ Model                │ GPU Setup   │ Hourly Cost    │ Throughput    │ Cost per 1M Tokens              │ │
+│  ├──────────────────────┼─────────────┼────────────────┼───────────────┼─────────────────────────────────┤ │
+│  │ Qwen3-VL-2B          │ 1× T4       │ $0.35/hr       │ 120 tok/s     │ $0.81                           │ │
+│  │ Qwen3-VL-4B          │ 1× L4       │ $0.80/hr       │ 100 tok/s     │ $2.22                           │ │
+│  │ Qwen3-VL-8B          │ 1× A100-40  │ $3.00/hr       │ 150 tok/s     │ $5.55                           │ │
+│  │ Qwen3-VL-8B          │ 1× A100-80  │ $4.00/hr       │ 200 tok/s     │ $5.55                           │ │
+│  │ Qwen3-VL-8B (FP8)    │ 1× H100     │ $8.00/hr       │ 400 tok/s     │ $5.55                           │ │
+│  │ Qwen3-VL-32B         │ 1× A100-80  │ $4.00/hr       │ 80 tok/s      │ $13.89                          │ │
+│  │ Qwen3-VL-32B (FP8)   │ 1× H100     │ $8.00/hr       │ 160 tok/s     │ $13.89                          │ │
+│  │ Qwen3-VL-30B-A3B     │ 1× A100-80  │ $4.00/hr       │ 100 tok/s     │ $11.11 (better than 32B!)      │ │
+│  │ Qwen3-VL-30B-A3B     │ 1× H100     │ $8.00/hr       │ 200 tok/s     │ $11.11                          │ │
+│  │ Qwen3-VL-235B-A22B   │ 8× H100     │ $64.00/hr      │ 80 tok/s      │ $222.22                         │ │
+│  └──────────────────────┴─────────────┴────────────────┴───────────────┴─────────────────────────────────┘ │
+│                                                                                                             │
+│  KEY INSIGHTS:                                                                                              │
+│  • MoE (30B-A3B) is more cost-effective than dense 32B with similar quality                                │
+│  • H100 is 2× throughput but 2× cost → same cost/token, but better latency                                 │
+│  • 2B on T4 is most cost-effective if quality is acceptable                                                 │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  LATENCY BREAKDOWN (single request, 1K output tokens):                                                      │
+│  ═════════════════════════════════════════════════════                                                      │
+│                                                                                                             │
+│  ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Model @ GPU          │ Prefill (TTFT)  │ Decode/token  │ Total (1K tok)  │ Bottleneck             │   │
+│  ├──────────────────────┼─────────────────┼───────────────┼─────────────────┼────────────────────────┤   │
+│  │ 8B @ A100-80         │ ~200ms          │ ~5ms          │ ~5.2s           │ Memory BW              │   │
+│  │ 8B @ H100            │ ~100ms          │ ~2.5ms        │ ~2.6s           │ Memory BW              │   │
+│  │ 32B @ H100           │ ~300ms          │ ~6ms          │ ~6.3s           │ Compute + Memory       │   │
+│  │ 30B-A3B @ H100       │ ~150ms          │ ~3ms          │ ~3.2s           │ Routing overhead       │   │
+│  │ 235B-A22B @ 8×H100   │ ~500ms          │ ~10ms         │ ~10.5s          │ All-to-All comm        │   │
+│  └──────────────────────┴─────────────────┴───────────────┴─────────────────┴────────────────────────┘   │
+│                                                                                                             │
+│  LATENCY ANALYSIS:                                                                                          │
+│  • Prefill (TTFT): Dominated by vision encoder for images, linear in image tokens                          │
+│  • Decode: Memory-bandwidth bound for dense, routing overhead for MoE                                       │
+│  • MoE wins on throughput but has higher variance in latency                                                │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  QUALITY vs SIZE (approximate, relative to GPT-4V baseline):                                                │
+│  ═══════════════════════════════════════════════════════════                                                │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                                                     │   │
+│  │   Quality                                                                                           │   │
+│  │      ▲                                                                                              │   │
+│  │  100%│                                              ┌─────────┐                                     │   │
+│  │      │                                              │ 235B    │ ← Frontier, beats GPT-4V           │   │
+│  │   95%│                           ┌──────────┐       │ -A22B   │                                     │   │
+│  │      │                           │   32B    │───────└─────────┘                                     │   │
+│  │   90%│          ┌─────────┐──────│ Dense    │                                                       │   │
+│  │      │          │ 30B-A3B │      └──────────┘                                                       │   │
+│  │   85%│   ┌──────│  MoE    │                                                                         │   │
+│  │      │   │ 8B   └─────────┘                         Note: MoE 30B-A3B achieves                     │   │
+│  │   80%│   │Dense │                                   similar quality to 32B dense                    │   │
+│  │      │───└──────┘                                   with 3× less compute!                           │   │
+│  │   70%│ ┌────┐                                                                                       │   │
+│  │      │ │ 4B │                                                                                       │   │
+│  │   60%│ └────┘                                                                                       │   │
+│  │      │┌────┐                                                                                        │   │
+│  │   50%││ 2B │                                                                                        │   │
+│  │      │└────┘                                                                                        │   │
+│  │      └─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬───────▶ FLOPs per token          │   │
+│  │               1G        3G        10G       30G       50G      100G                                 │   │
+│  │                                                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  KEY INSIGHT: MoE achieves disproportionate quality for compute cost!                                       │
+│  30B-A3B: 30B params of knowledge, but only 3B compute → best $/quality                                    │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Production Scenario Decision Tree
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PRODUCTION SCENARIO DECISION TREE                                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  START HERE: What's your primary constraint?                                                                │
+│  ═══════════════════════════════════════════                                                                │
+│                                                                                                             │
+│                                    ┌──────────────────────┐                                                 │
+│                                    │ What's your budget   │                                                 │
+│                                    │ and quality need?    │                                                 │
+│                                    └──────────┬───────────┘                                                 │
+│                                               │                                                             │
+│                 ┌─────────────────────────────┼─────────────────────────────┐                               │
+│                 │                             │                             │                               │
+│                 ▼                             ▼                             ▼                               │
+│     ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐                         │
+│     │ Cost is critical    │     │ Quality is critical │     │ Latency is critical │                         │
+│     │ (startup, high vol) │     │ (accuracy matters)  │     │ (real-time apps)    │                         │
+│     └──────────┬──────────┘     └──────────┬──────────┘     └──────────┬──────────┘                         │
+│                │                           │                           │                                    │
+│                ▼                           ▼                           ▼                                    │
+│     ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐                         │
+│     │ Simple tasks?       │     │ Can afford H100?    │     │ Can batch requests? │                         │
+│     └──────────┬──────────┘     └──────────┬──────────┘     └──────────┬──────────┘                         │
+│         │      │                     │      │                     │      │                                  │
+│        YES    NO                    YES    NO                    YES    NO                                  │
+│         │      │                     │      │                     │      │                                  │
+│         ▼      ▼                     ▼      ▼                     ▼      ▼                                  │
+│    ┌────────┐ ┌────────┐       ┌────────┐ ┌────────┐       ┌────────┐ ┌────────┐                            │
+│    │ 2B/T4  │ │ 4B/L4  │       │32B/H100│ │8B/A100 │       │MoE/H100│ │ 8B/H100│                            │
+│    │$0.81/M │ │$2.22/M │       │FP8     │ │BF16    │       │batched │ │FP8     │                            │
+│    └────────┘ └────────┘       └────────┘ └────────┘       └────────┘ └────────┘                            │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  SPECIFIC SCENARIOS:                                                                                        │
+│  ═══════════════════                                                                                        │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: Mobile App (Image Captioning)                                                             │   │
+│  │ ───────────────────────────────────────                                                             │   │
+│  │ Constraints: Low cost, <200ms latency, millions of requests                                         │   │
+│  │ Decision: Qwen3-VL-2B on T4 or edge deployment                                                      │   │
+│  │ Why: Smallest model, fastest inference, acceptable quality for captions                             │   │
+│  │ Config: max_model_len=2048, max_pixels=256×256, batch_size=8                                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: Document Processing Pipeline                                                              │   │
+│  │ ──────────────────────────────────────                                                              │   │
+│  │ Constraints: High volume, moderate quality, cost-sensitive                                          │   │
+│  │ Decision: Qwen3-VL-8B on A100-80GB                                                                  │   │
+│  │ Why: Best quality/cost ratio, handles tables/forms well, high throughput                            │   │
+│  │ Config: max_model_len=8192, max_pixels=1344×768, enable_chunked_prefill=True                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: GUI Automation Agent (MAI-UI)                                                             │   │
+│  │ ──────────────────────────────────────                                                              │   │
+│  │ Constraints: Must click right element, complex UIs, real-time interaction                           │   │
+│  │ Decision: Qwen3-VL-8B on H100 with FP8                                                              │   │
+│  │ Why: Best balance of accuracy and speed for UI understanding                                        │   │
+│  │ Config: max_model_len=4096, max_pixels=1920×1080, temperature=0.1                                   │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: Medical Image Analysis                                                                    │   │
+│  │ ────────────────────────────────────                                                                │   │
+│  │ Constraints: Accuracy paramount, regulatory compliance, moderate volume                             │   │
+│  │ Decision: Qwen3-VL-32B on H100 with FP8                                                             │   │
+│  │ Why: Highest accuracy for critical decisions, fine details matter                                   │   │
+│  │ Config: max_model_len=16384, max_pixels=3840×2160, temperature=0.0                                  │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: Mixed Workload API (Diverse Queries)                                                      │   │
+│  │ ─────────────────────────────────────────────                                                       │   │
+│  │ Constraints: Variable query complexity, maximize throughput, predictable cost                       │   │
+│  │ Decision: Qwen3-VL-30B-A3B (MoE) on H100                                                            │   │
+│  │ Why: High capacity handles complex, sparse activation handles simple efficiently                    │   │
+│  │ Config: max_model_len=32768, continuous batching, enable_prefix_caching=True                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ SCENARIO: Research/Benchmarking                                                                     │   │
+│  │ ─────────────────────────────────                                                                   │   │
+│  │ Constraints: Need best possible accuracy, cost secondary                                            │   │
+│  │ Decision: Qwen3-VL-235B-A22B on 8×H100                                                              │   │
+│  │ Why: Frontier-class capability, beats GPT-4V on benchmarks                                          │   │
+│  │ Config: tensor_parallel_size=8, max_model_len=65536                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation & Deployment Guide
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PRACTICAL DEPLOYMENT WITH VLLM                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                             │
+│  INSTALLATION:                                                                                              │
+│  ═════════════                                                                                              │
+│                                                                                                             │
+│  # Basic vLLM installation                                                                                  │
+│  pip install vllm>=0.6.0                                                                                    │
+│                                                                                                             │
+│  # For FP8 on H100 (requires CUDA 12.1+)                                                                   │
+│  pip install vllm[fp8]                                                                                      │
+│                                                                                                             │
+│  # For FlashInfer on T4 (optional, improves T4 performance)                                                │
+│  pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4                                        │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  DENSE MODEL DEPLOYMENT (8B example):                                                                       │
+│  ═════════════════════════════════════                                                                      │
+│                                                                                                             │
+│  ```python                                                                                                  │
+│  from vllm import LLM, SamplingParams                                                                       │
+│                                                                                                             │
+│  # A100-80GB: Full BF16                                                                                     │
+│  llm = LLM(                                                                                                 │
+│      model="Qwen/Qwen3-VL-8B-Instruct",                                                                     │
+│      dtype="bfloat16",                                                                                      │
+│      max_model_len=32768,                 # Up to 32K context                                               │
+│      gpu_memory_utilization=0.90,         # Use 90% of GPU memory                                           │
+│      enable_prefix_caching=True,          # Cache common prefixes (system prompts)                          │
+│      limit_mm_per_prompt={"image": 4, "video": 1},  # Max media per request                                │
+│      mm_processor_kwargs={                                                                                  │
+│          "min_pixels": 256 * 28 * 28,     # Min image size                                                 │
+│          "max_pixels": 1280 * 28 * 28,    # Max ~1280 tokens from images                                   │
+│      },                                                                                                     │
+│  )                                                                                                          │
+│                                                                                                             │
+│  # H100-80GB: FP8 for 2× throughput                                                                         │
+│  llm_h100 = LLM(                                                                                            │
+│      model="Qwen/Qwen3-VL-8B-Instruct",                                                                     │
+│      dtype="bfloat16",                                                                                      │
+│      quantization="fp8",                  # Enable FP8                                                      │
+│      kv_cache_dtype="fp8",                # FP8 KV cache (2× capacity)                                     │
+│      max_model_len=65536,                 # Up to 64K context                                               │
+│      gpu_memory_utilization=0.95,                                                                           │
+│      enable_chunked_prefill=True,         # Better TTFT for long prompts                                   │
+│  )                                                                                                          │
+│                                                                                                             │
+│  # T4-16GB: Aggressive optimization                                                                         │
+│  llm_t4 = LLM(                                                                                              │
+│      model="Qwen/Qwen3-VL-8B-Instruct",                                                                     │
+│      dtype="float16",                     # T4 doesn't support BF16                                        │
+│      quantization="bitsandbytes",         # 4-bit quantization                                             │
+│      load_format="bitsandbytes",                                                                            │
+│      max_model_len=4096,                  # Limited context                                                 │
+│      gpu_memory_utilization=0.95,                                                                           │
+│      enforce_eager=True,                  # Disable CUDA graphs (memory)                                   │
+│      mm_processor_kwargs={                                                                                  │
+│          "max_pixels": 512 * 28 * 28,     # Limit image size                                               │
+│      },                                                                                                     │
+│  )                                                                                                          │
+│  ```                                                                                                        │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  MoE MODEL DEPLOYMENT (30B-A3B):                                                                            │
+│  ═══════════════════════════════                                                                            │
+│                                                                                                             │
+│  ```python                                                                                                  │
+│  # Single A100-80GB: Fits all 128 experts                                                                   │
+│  llm_moe = LLM(                                                                                             │
+│      model="Qwen/Qwen3-VL-30B-A3B-Instruct",                                                                │
+│      dtype="bfloat16",                                                                                      │
+│      max_model_len=32768,                                                                                   │
+│      gpu_memory_utilization=0.95,         # Need high utilization (60GB weights)                           │
+│      enable_prefix_caching=True,                                                                            │
+│      # MoE-specific: higher batch helps GPU utilization                                                    │
+│      max_num_seqs=64,                     # More concurrent sequences                                       │
+│  )                                                                                                          │
+│                                                                                                             │
+│  # Single H100-80GB: FP8 weights, more KV cache room                                                        │
+│  llm_moe_h100 = LLM(                                                                                        │
+│      model="Qwen/Qwen3-VL-30B-A3B-Instruct",                                                                │
+│      dtype="bfloat16",                                                                                      │
+│      quantization="fp8",                  # 30GB weights instead of 60GB                                   │
+│      kv_cache_dtype="fp8",                                                                                  │
+│      max_model_len=65536,                                                                                   │
+│      gpu_memory_utilization=0.95,                                                                           │
+│      max_num_seqs=128,                    # Even more concurrent sequences                                  │
+│  )                                                                                                          │
+│  ```                                                                                                        │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  MULTI-GPU DEPLOYMENT (235B-A22B on 8×H100):                                                                │
+│  ═══════════════════════════════════════════                                                                │
+│                                                                                                             │
+│  ```python                                                                                                  │
+│  # Tensor parallel across 8 GPUs                                                                            │
+│  llm_235b = LLM(                                                                                            │
+│      model="Qwen/Qwen3-VL-235B-A22B-Instruct",                                                              │
+│      dtype="bfloat16",                                                                                      │
+│      tensor_parallel_size=8,              # Distribute across 8 GPUs                                        │
+│      max_model_len=65536,                                                                                   │
+│      gpu_memory_utilization=0.95,                                                                           │
+│      enable_prefix_caching=True,                                                                            │
+│      # Expert parallelism handled automatically                                                             │
+│  )                                                                                                          │
+│                                                                                                             │
+│  # Server deployment with tensor parallel                                                                   │
+│  # vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \                                                           │
+│  #     --tensor-parallel-size 8 \                                                                          │
+│  #     --max-model-len 65536 \                                                                              │
+│  #     --enable-prefix-caching                                                                              │
+│  ```                                                                                                        │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  KV CACHE CONSIDERATIONS:                                                                                   │
+│  ═════════════════════════                                                                                  │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ KV CACHE SIZE FORMULA:                                                                              │   │
+│  │                                                                                                     │   │
+│  │ KV_bytes_per_token = 2 × num_layers × kv_heads × head_dim × bytes_per_element                      │   │
+│  │                                                                                                     │   │
+│  │ Examples:                                                                                           │   │
+│  │ • 8B (32 layers, 8 KV heads, 128 dim, BF16): 2×32×8×128×2 = 128 KB/token                           │   │
+│  │ • 8B (FP8 KV cache): 2×32×8×128×1 = 64 KB/token (2× more tokens fit!)                              │   │
+│  │ • 32B (64 layers, 8 KV heads, 128 dim, BF16): 2×64×8×128×2 = 256 KB/token                          │   │
+│  │                                                                                                     │   │
+│  │ For 80GB GPU with 60GB for KV cache:                                                                │   │
+│  │ • 8B BF16: 60GB ÷ 128KB = 468,750 tokens total KV capacity                                         │   │
+│  │ • 8B FP8: 60GB ÷ 64KB = 937,500 tokens (2×!)                                                       │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ PAGEDATTENTION BLOCK SIZE CHOICE:                                                                   │   │
+│  │                                                                                                     │   │
+│  │ vLLM default: 16 tokens/block                                                                       │   │
+│  │                                                                                                     │   │
+│  │ Trade-offs:                                                                                         │   │
+│  │ • Smaller blocks (8): Less internal fragmentation, more block table overhead                       │   │
+│  │ • Larger blocks (32): Less overhead, more fragmentation for short sequences                        │   │
+│  │                                                                                                     │   │
+│  │ Recommendation: Use default (16) unless you have specific needs                                    │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  BATCHING STRATEGIES:                                                                                       │
+│  ═══════════════════                                                                                        │
+│                                                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ DENSE MODELS:                                                                                       │   │
+│  │ • Continuous batching: Let vLLM handle it (default)                                                 │   │
+│  │ • max_num_seqs: 16-32 for A100, 64-128 for H100                                                     │   │
+│  │ • Prefill/decode split: Use chunked_prefill for mixed workloads                                     │   │
+│  │                                                                                                     │   │
+│  │ MoE MODELS:                                                                                         │   │
+│  │ • LARGER BATCHES = BETTER GPU UTILIZATION                                                           │   │
+│  │ • More tokens → more tokens per expert → better Tensor Core utilization                            │   │
+│  │ • Recommendation: max_num_seqs=64-128 even on A100                                                  │   │
+│  │ • Trade-off: Higher latency per request, but much higher throughput                                 │   │
+│  │                                                                                                     │   │
+│  │ MULTIMODAL-SPECIFIC:                                                                                │   │
+│  │ • Image prefill is expensive: use enable_chunked_prefill=True                                       │   │
+│  │ • Video tokens can be huge: use video_pruning_rate (EVS) to reduce                                  │   │
+│  │ • Prefix caching helps if same images/videos are reused                                             │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                                             │
+│  PRODUCTION CHECKLIST:                                                                                      │
+│  ═════════════════════                                                                                      │
+│                                                                                                             │
+│  □ GPU selection matches model size (see Quick Reference table)                                             │
+│  □ Memory utilization set appropriately (0.85-0.95)                                                         │
+│  □ max_model_len set based on use case (not max possible)                                                   │
+│  □ FP8 enabled if H100+ and throughput matters                                                              │
+│  □ Prefix caching enabled if prompts share common prefixes                                                  │
+│  □ Chunked prefill enabled for mixed prefill/decode workloads                                               │
+│  □ Image/video limits set to avoid OOM on large media                                                       │
+│  □ Health checks and graceful degradation implemented                                                       │
+│  □ Metrics/logging for latency percentiles (p50, p95, p99)                                                  │
+│  □ Load testing completed with realistic traffic patterns                                                   │
+│                                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
