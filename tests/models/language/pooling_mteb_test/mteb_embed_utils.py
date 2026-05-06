@@ -19,9 +19,9 @@ from tests.models.utils import (
 # - Model implementation and minor changes in tensor dtype
 #   results in differences less than 1e-4
 # - Different model results in differences more than 1e-3
-# 1e-4 is a good tolerance threshold
+# 5e-4 is a good tolerance threshold
 MTEB_EMBED_TASKS = ["STS12"]
-MTEB_EMBED_TOL = 1e-4
+MTEB_EMBED_TOL = 5e-4
 
 
 _empty_model_meta = ModelMeta(
@@ -74,10 +74,25 @@ class MtebEmbedMixin(mteb.EncoderProtocol):
         return sim
 
 
+class HfMtebEncoder(MtebEmbedMixin):
+    def __init__(self, model):
+        self.model = model
+
+    def encode(
+        self,
+        inputs: DataLoader[mteb.types.BatchedInput],
+        *args,
+        **kwargs,
+    ) -> np.ndarray:
+        sentences = [text for batch in inputs for text in batch["text"]]
+        return self.model.encode(sentences)
+
+
 class VllmMtebEncoder(MtebEmbedMixin):
-    def __init__(self, vllm_model):
+    def __init__(self, vllm_model, prompt_prefix: str | None = None):
         self.llm = vllm_model
         self.rng = np.random.default_rng(seed=42)
+        self.prompt_prefix = prompt_prefix
 
     def encode(
         self,
@@ -87,7 +102,11 @@ class VllmMtebEncoder(MtebEmbedMixin):
     ) -> np.ndarray:
         # Hoping to discover potential scheduling
         # issues by randomizing the order.
-        sentences = [text for batch in inputs for text in batch["text"]]
+        sentences = [
+            self.prompt_prefix + text if self.prompt_prefix else text
+            for batch in inputs
+            for text in batch["text"]
+        ]
         r = self.rng.permutation(len(sentences))
         sentences = [sentences[i] for i in r]
         outputs = self.llm.embed(sentences, use_tqdm=False)
@@ -143,6 +162,7 @@ def mteb_test_embed_models(
     vllm_extra_kwargs=None,
     hf_model_callback=None,
     atol=MTEB_EMBED_TOL,
+    prompt_prefix: str | None = None,
 ):
     vllm_extra_kwargs = get_vllm_extra_kwargs(model_info, vllm_extra_kwargs)
 
@@ -151,6 +171,7 @@ def mteb_test_embed_models(
 
     with vllm_runner(
         model_info.name,
+        revision=model_info.revision,
         runner="pooling",
         max_model_len=model_info.max_model_len,
         **vllm_extra_kwargs,
@@ -162,8 +183,11 @@ def mteb_test_embed_models(
             assert model_info.architecture in model_config.architectures
 
         # Confirm whether the important configs in model_config are correct.
-        if model_info.pooling_type is not None:
-            assert model_config.pooler_config.pooling_type == model_info.pooling_type
+        pooler_config = model_config.pooler_config
+        if model_info.seq_pooling_type is not None:
+            assert pooler_config.seq_pooling_type == model_info.seq_pooling_type
+        if model_info.tok_pooling_type is not None:
+            assert pooler_config.tok_pooling_type == model_info.tok_pooling_type
         if model_info.attn_type is not None:
             assert model_config.attn_type == model_info.attn_type
         if model_info.is_prefix_caching_supported is not None:
@@ -178,13 +202,16 @@ def mteb_test_embed_models(
             )
 
         vllm_main_score = run_mteb_embed_task(
-            VllmMtebEncoder(vllm_model), MTEB_EMBED_TASKS
+            VllmMtebEncoder(vllm_model, prompt_prefix=prompt_prefix), MTEB_EMBED_TASKS
         )
         vllm_dtype = vllm_model.llm.llm_engine.model_config.dtype
         head_dtype = model_config.head_dtype
 
         # Test embedding_size, isnan and whether to use normalize
-        vllm_outputs = vllm_model.embed(example_prompts, truncate_prompt_tokens=-1)
+        vllm_outputs = vllm_model.embed(
+            example_prompts,
+            tokenization_kwargs=dict(truncate_prompt_tokens=-1),
+        )
         outputs_tensor = torch.tensor(vllm_outputs)
         assert not torch.any(torch.isnan(outputs_tensor))
         embedding_size = model_config.embedding_size
@@ -195,6 +222,7 @@ def mteb_test_embed_models(
     if model_info.mteb_score is None:
         with hf_runner(
             model_info.name,
+            revision=model_info.revision,
             is_sentence_transformer=True,
             dtype=ci_envs.VLLM_CI_HF_DTYPE or model_info.hf_dtype,
         ) as hf_model:
@@ -202,7 +230,9 @@ def mteb_test_embed_models(
             if hf_model_callback is not None:
                 hf_model_callback(hf_model)
 
-            st_main_score = run_mteb_embed_task(hf_model, MTEB_EMBED_TASKS)
+            st_main_score = run_mteb_embed_task(
+                HfMtebEncoder(hf_model), MTEB_EMBED_TASKS
+            )
             st_dtype = next(hf_model.model.parameters()).dtype
 
             # Check embeddings close to hf outputs

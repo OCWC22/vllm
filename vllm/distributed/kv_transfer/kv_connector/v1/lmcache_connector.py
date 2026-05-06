@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import (
     BlockStored,
@@ -19,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -70,6 +70,16 @@ class LMCacheKVEvents(KVConnectorKVEvents):
 
 
 class LMCacheConnectorV1(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """
+        LMCache requires PIECEWISE CUDA graph mode when layerwise
+        operations are enabled. The wait_for_layer_load and save_kv_layer
+        methods perform actual async synchronization that cannot be
+        captured in CUDA graphs.
+        """
+        return extra_config.get("use_layerwise", False)
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -234,7 +244,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 lora_id=e.lora_id,
                 block_size=e.block_size,
                 medium=e.medium,
-                lora_name=e.lora_name,
+                lora_name=getattr(e, "lora_name", None),
             )
             for e in events
         ]

@@ -4,16 +4,19 @@ import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from vllm.entrypoints.openai.parser.harmony_utils import parse_output_into_messages
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
+)
+from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.parser.harmony_utils import parse_output_into_messages
 from vllm.logger import init_logger
 from vllm.tool_parsers.abstract_tool_parser import (
+    Tool,
     ToolParser,
 )
 
@@ -26,8 +29,8 @@ logger = init_logger(__name__)
 
 
 class OpenAIToolParser(ToolParser):
-    def __init__(self, tokenizer: "TokenizerLike"):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: "TokenizerLike", tools: list[Tool] | None = None):
+        super().__init__(tokenizer, tools)
 
     def extract_tool_calls(
         self,

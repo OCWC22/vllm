@@ -32,10 +32,14 @@ class IsaacConfig(Qwen3Config):
     """Configuration class for Isaac multimodal model."""
 
     model_type = "isaac"
-    sub_configs = {"vision_config": PixelShuffleSiglip2VisionConfig}
+    sub_configs = {
+        "vision_config": PixelShuffleSiglip2VisionConfig,
+        "text_config": Qwen3Config,
+    }
 
     def __init__(
         self,
+        text_config=None,
         vision_config=None,
         vision_patch_size: int = 16,
         vision_max_num_patches: int = 256,
@@ -46,7 +50,15 @@ class IsaacConfig(Qwen3Config):
         vision_attn_implementation: str | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        if isinstance(text_config, dict):
+            # from HF config
+            self.text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            # For BC use all kwargs to init text config.
+            self.text_config = self.sub_configs["text_config"](**kwargs)
+        else:
+            # from Qwen3Config
+            self.text_config = text_config
 
         # EventStreamProcessor parameters (for backward compatibility)
         self.video_patch_size = vision_patch_size
@@ -78,6 +90,7 @@ class IsaacConfig(Qwen3Config):
             vision_max_num_patches,
         )
         self.vision_attn_implementation = vision_attn_implementation
+        super().__init__(**kwargs)
 
 
 __all__ = [

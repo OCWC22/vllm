@@ -12,9 +12,13 @@ MODELS = [
     EmbedModelInfo(
         "nomic-ai/nomic-embed-text-v1",
         architecture="NomicBertModel",
+        # Fixme:
+        #  Update nomic-embed code to support the latest
+        #  HF version and remove revision set.
+        revision="720244025c1a7e15661a174c63cce63c8218e52b",
         mteb_score=0.737568559,
         enable_test=True,
-        pooling_type="MEAN",
+        seq_pooling_type="MEAN",
         attn_type="encoder_only",
         is_prefix_caching_supported=False,
         is_chunked_prefill_supported=False,
@@ -32,7 +36,7 @@ MODELS = [
         architecture="NomicBertModel",
         mteb_score=0.715488912,
         enable_test=True,
-        pooling_type="MEAN",
+        seq_pooling_type="MEAN",
         attn_type="encoder_only",
         is_prefix_caching_supported=False,
         is_chunked_prefill_supported=False,

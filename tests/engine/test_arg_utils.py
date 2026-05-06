@@ -3,15 +3,16 @@
 
 import json
 from argparse import ArgumentError
-from contextlib import nullcontext
-from dataclasses import dataclass, field
+from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated, Literal
 
 import pytest
+from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, config
 from vllm.engine.arg_utils import (
     EngineArgs,
+    _expand_json_human_readable_numbers,
     contains_type,
     get_kwargs,
     get_type,
@@ -96,7 +97,7 @@ def test_get_type(type_hints, type, expected):
     ],
 )
 def test_literal_to_kwargs(type_hints, expected):
-    context = nullcontext()
+    context: AbstractContextManager[object] = nullcontext()
     if expected is Exception:
         context = pytest.raises(expected)
     with context:
@@ -104,14 +105,12 @@ def test_literal_to_kwargs(type_hints, expected):
 
 
 @config
-@dataclass
 class NestedConfig:
     field: int = 1
     """field"""
 
 
 @config
-@dataclass
 class DummyConfig:
     regular_bool: bool = True
     """Regular bool with default True"""
@@ -119,23 +118,23 @@ class DummyConfig:
     """Optional bool with default None"""
     optional_literal: Literal["x", "y"] | None = None
     """Optional literal with default None"""
-    tuple_n: tuple[int, ...] = field(default_factory=lambda: (1, 2, 3))
+    tuple_n: tuple[int, ...] = Field(default_factory=lambda: (1, 2, 3))
     """Tuple with variable length"""
-    tuple_2: tuple[int, int] = field(default_factory=lambda: (1, 2))
+    tuple_2: tuple[int, int] = Field(default_factory=lambda: (1, 2))
     """Tuple with fixed length"""
-    list_n: list[int] = field(default_factory=lambda: [1, 2, 3])
+    list_n: list[int] = Field(default_factory=lambda: [1, 2, 3])
     """List with variable length"""
-    list_literal: list[Literal[1, 2]] = field(default_factory=list)
+    list_literal: list[Literal[1, 2]] = Field(default_factory=list)
     """List with literal choices"""
-    list_union: list[str | type[object]] = field(default_factory=list)
+    list_union: list[str | type[object]] = Field(default_factory=list)
     """List with union type"""
-    set_n: set[int] = field(default_factory=lambda: {1, 2, 3})
+    set_n: set[int] = Field(default_factory=lambda: {1, 2, 3})
     """Set with variable length"""
     literal_literal: Literal[Literal[1], Literal[2]] = 1
     """Literal of literals with default 1"""
-    json_tip: dict = field(default_factory=dict)
+    json_tip: dict = Field(default_factory=dict)
     """Dict which will be JSON in CLI"""
-    nested_config: NestedConfig = field(default_factory=NestedConfig)
+    nested_config: NestedConfig = Field(default_factory=NestedConfig)
     """Nested config"""
 
 
@@ -195,7 +194,7 @@ def test_get_kwargs():
     json_tip = "Should either be a valid JSON string or JSON keys"
     assert json_tip in kwargs["json_tip"]["help"]
     # nested config should construct the nested config
-    assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)
+    assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -299,7 +298,7 @@ def test_compilation_config():
 
 
 def test_attention_config():
-    from vllm.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
 
@@ -334,8 +333,6 @@ def test_attention_config():
             "true",
             "--attention-config.flash_attn_max_num_splits_for_cuda_graph",
             "16",
-            "--attention-config.use_cudnn_prefill",
-            "true",
             "--attention-config.use_trtllm_ragged_deepseek_prefill",
             "true",
             "--attention-config.use_trtllm_attention",
@@ -353,7 +350,6 @@ def test_attention_config():
     assert engine_args.attention_config.flash_attn_version == 3
     assert engine_args.attention_config.use_prefill_decode_attention is True
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 16
-    assert engine_args.attention_config.use_cudnn_prefill is True
     assert engine_args.attention_config.use_trtllm_ragged_deepseek_prefill is True
     assert engine_args.attention_config.use_trtllm_attention is True
     assert engine_args.attention_config.disable_flashinfer_prefill is True
@@ -525,3 +521,72 @@ def test_human_readable_model_len():
     for invalid in ["1a", "pwd", "10.24", "1.23M", "1.22T"]:
         with pytest.raises(ArgumentError):
             parser.parse_args(["--max-model-len", invalid])
+
+
+def test_numa_bind_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--numa-bind",
+            "--numa-bind-nodes",
+            "0",
+            "0",
+            "1",
+            "1",
+            "--numa-bind-cpus",
+            "0-3",
+            "4-7",
+            "8-11",
+            "12-15",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.numa_bind is True
+    assert engine_args.numa_bind_nodes == [0, 0, 1, 1]
+    assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
+
+
+def test_ir_op_priority():
+    from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
+
+    ir_op_priority = IrOpPriorityConfig(rms_norm=["vllm_c"])
+    cfg1 = EngineArgs(ir_op_priority=ir_op_priority).create_engine_config()
+    cfg2 = EngineArgs(
+        kernel_config=KernelConfig(ir_op_priority=ir_op_priority)
+    ).create_engine_config()
+    assert cfg1.kernel_config.ir_op_priority == cfg2.kernel_config.ir_op_priority
+
+    with pytest.raises(ValueError, match="rms_norm"):
+        _ = EngineArgs(
+            ir_op_priority=ir_op_priority,
+            kernel_config=KernelConfig(ir_op_priority=ir_op_priority),
+        ).create_engine_config()
+
+
+@pytest.mark.parametrize(
+    ("input_json", "expected_json"),
+    [
+        # Decimal suffixes (lowercase)
+        ('{"x": 80g}', '{"x": 80000000000}'),
+        ('{"x": 1k}', '{"x": 1000}'),
+        ('{"x": 5m}', '{"x": 5000000}'),
+        ('{"x": 2t}', '{"x": 2000000000000}'),
+        # Binary suffixes (uppercase)
+        ('{"x": 1K}', f'{{"x": {2**10}}}'),
+        ('{"x": 1G}', f'{{"x": {2**30}}}'),
+        # Decimal values
+        ('{"x": 1.5g}', '{"x": 1500000000}'),
+        # Quoted strings must NOT be modified
+        ('{"my_key": 80g}', '{"my_key": 80000000000}'),
+        ('{"name": "80g"}', '{"name": "80g"}'),
+        ('{"model_name": "foo_bar"}', '{"model_name": "foo_bar"}'),
+        # Multiple values
+        ('{"a": 1k, "b": 2m}', '{"a": 1000, "b": 2000000}'),
+        # Plain numbers are untouched
+        ('{"x": 42}', '{"x": 42}'),
+        # Nested JSON
+        ('{"outer": {"inner": 10g}}', '{"outer": {"inner": 10000000000}}'),
+    ],
+)
+def test_expand_json_human_readable_numbers(input_json, expected_json):
+    assert _expand_json_human_readable_numbers(input_json) == expected_json
