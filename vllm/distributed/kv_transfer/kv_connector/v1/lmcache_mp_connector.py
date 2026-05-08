@@ -198,6 +198,7 @@ class LMCacheMPRequestTracker:
     # Block ids and hashes will be updated at update_states_after_alloc and
     # during the generation
     allocated_block_ids: list[int] = field(default_factory=list)
+    num_reported_blocks: int = 0
 
     # Number of scheduled tokens in this request. We keep tracking this to
     # avoid saving half-full blocks.
@@ -223,6 +224,7 @@ class LMCacheMPRequestTracker:
         self.all_token_ids = request.all_token_ids
         self.block_hashes = ConstantList(request.block_hashes)
         self.allocated_block_ids = []
+        self.num_reported_blocks = 0
         self.num_stored_blocks = 0
         self.num_vllm_hit_blocks = 0
         self.num_lmcache_hit_blocks = 0
@@ -267,6 +269,14 @@ class LMCacheMPRequestTracker:
         This function will be called when processing the cached requests.
         """
         self.allocated_block_ids.extend(new_block_ids)
+
+    def replace_block_ids(
+        self,
+        block_ids: list[int],
+    ):
+        """Replace block ids after vLLM resumes a preempted request."""
+        self.allocated_block_ids = list(block_ids)
+        self.num_reported_blocks = 0
 
     ####
     # For debugging
@@ -897,7 +907,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             logger.debug("Final connector metadata: %s", metadata)
 
         # Report block allocation deltas to LMCache for observability
-        self._report_block_allocation_deltas(scheduler_output)
+        self._report_block_allocation_deltas()
 
         return metadata
 
@@ -1074,7 +1084,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
 
             # Update block ids
             new_block_ids = reformat_block_ids(cached_reqs.new_block_ids[idx])
-            if request_id not in cached_reqs.resumed_req_ids:
+            if request_id in cached_reqs.resumed_req_ids:
+                request_tracker.replace_block_ids(new_block_ids)
+            else:
                 request_tracker.append_block_ids(new_block_ids)
 
             # Use the incremental num_scheduled_tokens to
@@ -1089,52 +1101,28 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             if r_meta is not None:
                 metadata.add_request_metadata(r_meta)
 
-    def _report_block_allocation_deltas(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> None:
-        """Gather per-request block allocation deltas and report to LMCache.
-
-        For new requests: all allocated_block_ids and token_ids are new.
-        For cached requests: only newly appended block_ids and token_ids.
-        """
+    def _report_block_allocation_deltas(self) -> None:
+        """Gather per-request block allocation deltas and report to LMCache."""
         records: list[RequestAllocationRecord] = []
+        reported_counts: dict[str, int] = {}
 
-        # New requests: send all tokens covering all allocated blocks so
-        # the L0 metrics subscriber can correctly map each block to its
-        # actual token content (not just the newly-scheduled slice).
-        for new_request in scheduler_output.scheduled_new_reqs:
-            tracker = self.request_trackers.get(new_request.req_id)
-            if tracker is None:
+        for request_id, tracker in self.request_trackers.items():
+            num_reported_blocks = tracker.num_reported_blocks
+            num_allocated_blocks = len(tracker.allocated_block_ids)
+            if num_allocated_blocks <= num_reported_blocks:
                 continue
-            num_blocks = len(tracker.allocated_block_ids)
-            total_tokens = num_blocks * self.vllm_block_size
-            records.append(
-                RequestAllocationRecord(
-                    req_id=new_request.req_id,
-                    new_block_ids=list(tracker.allocated_block_ids),
-                    new_token_ids=list(tracker.all_token_ids[:total_tokens]),
-                )
+
+            start_token = num_reported_blocks * self.vllm_block_size
+            end_token = min(
+                num_allocated_blocks * self.vllm_block_size,
+                len(tracker.all_token_ids),
             )
+            if end_token <= start_token:
+                continue
 
-        # Cached requests: only the newly added blocks and their full
-        # token content.  We send all tokens covered by the new blocks
-        # (not just the tokens scheduled this step) so the L0 subscriber
-        # can correctly identify block content.
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        for idx, request_id in enumerate(cached_reqs.req_ids):
-            new_block_ids = reformat_block_ids(cached_reqs.new_block_ids[idx])
-            if not new_block_ids:
-                continue
-            tracker = self.request_trackers.get(request_id)
-            if tracker is None:
-                continue
-            # The new blocks sit at the end of the request's block list.
-            # Compute the token range they cover.
-            total_blocks = len(tracker.allocated_block_ids)
-            num_new_blocks = len(new_block_ids)
-            start_token = (total_blocks - num_new_blocks) * self.vllm_block_size
-            end_token = total_blocks * self.vllm_block_size
+            new_block_ids = tracker.allocated_block_ids[
+                num_reported_blocks:num_allocated_blocks
+            ]
             new_token_ids = list(tracker.all_token_ids[start_token:end_token])
             records.append(
                 RequestAllocationRecord(
@@ -1143,9 +1131,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                     new_token_ids=new_token_ids,
                 )
             )
+            reported_counts[request_id] = num_allocated_blocks
 
         if records:
             self.scheduler_adapter.report_block_allocations(records)
+            for request_id, count in reported_counts.items():
+                self.request_trackers[request_id].num_reported_blocks = count
 
     def _get_request_tracker(self, request_id: str) -> LMCacheMPRequestTracker:
         assert request_id in self.request_trackers, (
