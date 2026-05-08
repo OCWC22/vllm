@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -109,3 +110,20 @@ def test_reports_each_tracker_block_delta_once():
     assert record.new_block_ids == [12]
     assert record.new_token_ids == list(range(32, 40))
     assert connector.request_trackers["req-1"].num_reported_blocks == 3
+
+
+def test_records_l0_boundary_evidence_when_enabled(tmp_path, monkeypatch):
+    evidence_path = tmp_path / "l0-boundary.jsonl"
+    monkeypatch.setenv("INFERGUARD_L0_BLOCK_BOUNDARY_EVIDENCE_PATH", str(evidence_path))
+    connector = make_connector_with_tracker([10, 11])
+
+    connector.build_connector_meta(SchedulerOutput.make_empty())
+
+    events = [json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["stage"] for event in events] == [
+        "report_block_allocation_attempt",
+        "report_block_allocation_sent",
+    ]
+    assert events[0]["source"] == "vllm_lmcache_mp_connector"
+    assert events[0]["records"] == [{"request_id": "req-1", "block_count": 2}]
+    assert "new_token_ids" not in json.dumps(events)

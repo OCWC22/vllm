@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import json
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -63,6 +66,36 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+L0_BLOCK_BOUNDARY_EVIDENCE_ENV = "INFERGUARD_L0_BLOCK_BOUNDARY_EVIDENCE_PATH"
+
+
+def _append_l0_block_boundary_event(
+    stage: str,
+    records: list[RequestAllocationRecord],
+) -> None:
+    """Append redacted L0 block-allocation boundary evidence when requested."""
+    path = os.environ.get(L0_BLOCK_BOUNDARY_EVIDENCE_ENV, "").strip()
+    if not path:
+        return
+    payload = {
+        "schema_version": "inferguard-l0-block-boundary-event/v1",
+        "source": "vllm_lmcache_mp_connector",
+        "stage": stage,
+        "timestamp_unix": time.time(),
+        "records": [
+            {
+                "request_id": record.req_id,
+                "block_count": len(record.new_block_ids),
+            }
+            for record in records
+        ],
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        logger.debug("Failed to append L0 block boundary evidence", exc_info=True)
 
 
 # Helper functions
@@ -1139,7 +1172,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             reported_counts[request_id] = num_allocated_blocks
 
         if records:
+            _append_l0_block_boundary_event("report_block_allocation_attempt", records)
             self.scheduler_adapter.report_block_allocations(records)
+            _append_l0_block_boundary_event("report_block_allocation_sent", records)
             for request_id, count in reported_counts.items():
                 self.request_trackers[request_id].num_reported_blocks = count
 
