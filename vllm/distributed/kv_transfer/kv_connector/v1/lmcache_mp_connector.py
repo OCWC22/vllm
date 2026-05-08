@@ -885,6 +885,11 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                         free_end,
                     )
 
+        # Block IDs are appended after scheduler metadata is built. Report
+        # immediately so single-step requests do not finish and get cleaned up
+        # before the next build_connector_meta() call can publish deltas.
+        self._report_block_allocation_deltas()
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
