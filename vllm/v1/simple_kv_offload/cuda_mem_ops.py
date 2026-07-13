@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Low-level CUDA memory helpers: pinning and batch DMA transfers."""
+"""Low-level CUDA/HIP memory helpers: pinning and batch DMA transfers."""
 
 import ctypes
 from typing import Any, NamedTuple
@@ -9,8 +9,15 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+# CUmemcpySrcAccessOrder values (CUDA driver API). STREAM(1): source read in
+# stream order, safe when the source may still be written. ANY(3): source may
+# be read early, only safe for a stable source (e.g. pinned host memory).
+CU_MEMCPY_SRC_ACCESS_ORDER_STREAM = 1
+CU_MEMCPY_SRC_ACCESS_ORDER_ANY = 3
 
 
 def pin_tensor(tensor: torch.Tensor) -> None:
@@ -39,7 +46,7 @@ class _CUmemcpyAttributes(ctypes.Structure):
 
 
 _BATCH_MEMCPY_FUNC_TYPE = ctypes.CFUNCTYPE(
-    ctypes.c_uint,  # CUresult
+    ctypes.c_uint,  # CUresult / hipError_t
     ctypes.c_void_p,
     ctypes.c_void_p,
     ctypes.c_void_p,
@@ -56,7 +63,42 @@ _batch_memcpy_fn: Any = None
 
 
 def _resolve_batch_memcpy():
-    """Resolve cuMemcpyBatchAsync via cuGetProcAddress (one-time)."""
+    """Resolve the platform batch-memcpy entry point (one-time).
+
+    * CUDA: ``cuMemcpyBatchAsync`` via ``cuGetProcAddress`` (uses
+      srcAccessOrder=STREAM via one attributes entry).
+    * ROCm: ``hipMemcpyBatchAsync`` from libamdhip64 (ROCm 7.1+). ROCm
+      7.2.1 or 7.2.2 rejects any call with ``numAttrs > 0``
+      (see ROCm/clr @ rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so
+      we call with ``numAttrs=0``.
+
+    Raises ``RuntimeError`` if the symbol is unavailable (older CUDA
+    driver, ROCm < 7.1, unusual install). The connector requires the
+    batch API.
+    """
+    if current_platform.is_rocm():
+        try:
+            lib = ctypes.CDLL("libamdhip64.so", mode=ctypes.RTLD_GLOBAL)
+            fn = lib.hipMemcpyBatchAsync
+        except (OSError, AttributeError) as e:
+            raise RuntimeError(
+                "hipMemcpyBatchAsync is unavailable in this ROCm install; "
+                "SimpleCPUOffloadConnector requires ROCm 7.1+."
+            ) from e
+        fn.restype = ctypes.c_uint
+        fn.argtypes = [
+            ctypes.c_void_p,  # dsts
+            ctypes.c_void_p,  # srcs
+            ctypes.c_void_p,  # sizes
+            ctypes.c_size_t,  # count
+            ctypes.c_void_p,  # attrs
+            ctypes.c_void_p,  # attrIdxs
+            ctypes.c_size_t,  # numAttrs
+            ctypes.c_void_p,  # failIdx
+            ctypes.c_void_p,  # stream
+        ]
+        return fn
+
     from cuda.bindings import driver as drv
 
     err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
@@ -70,6 +112,8 @@ class BatchMemcpyParams(NamedTuple):
     dst_bases: np.ndarray  # [num_layers] uint64
     bpb: np.ndarray  # [num_layers] uint64 — bytes per block
     num_layers: int
+    # CUDA only: one attributes entry carrying srcAccessOrder. Unused on ROCm
+    # (7.2.1 or 7.2.2) because the current runtime rejects numAttrs > 0.
     attrs: _CUmemcpyAttributes
     attrs_idx: ctypes.c_size_t
     # NOTE: cuMemcpyBatchAsync_v2() removed fail_idx field, but we use
@@ -82,6 +126,7 @@ def build_params(
     src_caches: dict[str, torch.Tensor],
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
+    src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
 ) -> BatchMemcpyParams:
     global _batch_memcpy_fn
     if _batch_memcpy_fn is None:
@@ -99,8 +144,7 @@ def build_params(
         dst_bases.append(d.data_ptr())
         bpb.append(s_bpb)
 
-    # Refer to https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g6f1ff58e3065df3eb4b573dba77ad31f for details.  # noqa: E501
-    attrs = _CUmemcpyAttributes(srcAccessOrder=3)  # ANY
+    attrs = _CUmemcpyAttributes(srcAccessOrder=src_access_order)
 
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),
@@ -114,15 +158,33 @@ def build_params(
     )
 
 
-def copy_blocks(
+class PreparedBatchCopy(NamedTuple):
+    """Host-side (pure NumPy) staging for a batch memcpy call.
+
+    Kept separate from submission so callers can time the DMA submit alone,
+    excluding this NumPy prep, while still keeping the arrays alive for the
+    lifetime of the in-flight `cuMemcpyBatchAsync` call (the driver reads
+    them synchronously at submit time, so no extra lifetime management is
+    needed beyond holding a reference to this tuple until submit returns).
+    """
+
+    src_all: np.ndarray
+    dst_all: np.ndarray
+    sz_all: np.ndarray
+    total_transfers: int
+    total_bytes: int
+
+
+def prepare_copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
-) -> None:
-    """Copy blocks via cuMemcpyBatchAsync."""
+) -> PreparedBatchCopy | None:
+    """Compute per-transfer src/dst addresses and sizes. Returns None iff
+    there are zero transfers (nothing to submit)."""
     n = len(src_block_ids)
     if n == 0:
-        return
+        return None
 
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
@@ -134,20 +196,56 @@ def copy_blocks(
         params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
     ).ravel()
     sz_all = np.repeat(params.bpb, n)
-
     total = n * params.num_layers
+
+    return PreparedBatchCopy(
+        src_all=src_all,
+        dst_all=dst_all,
+        sz_all=sz_all,
+        total_transfers=total,
+        total_bytes=int(sz_all.sum()),
+    )
+
+
+def submit_prepared_copy(
+    prepared: PreparedBatchCopy,
+    params: BatchMemcpyParams,
+) -> None:
+    """Submit a prepared batch to cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
+    # ROCm 7.2.1/7.2.2 rejects any call with numAttrs>0 (hipMemcpyBatchAsync
+    # hipamd/src/hip_memory.cpp:2819-2822); CUDA uses one attrs entry so
+    # srcAccessOrder is honored. attrs / attrsIdxs are ignored when
+    # numAttrs==0, so we pass the same values from both paths.
+    num_attrs = 0 if current_platform.is_rocm() else 1
     err = _batch_memcpy_fn(
-        dst_all.ctypes.data,
-        src_all.ctypes.data,
-        sz_all.ctypes.data,
-        total,
+        prepared.dst_all.ctypes.data,
+        prepared.src_all.ctypes.data,
+        prepared.sz_all.ctypes.data,
+        prepared.total_transfers,
         ctypes.addressof(params.attrs),
         ctypes.byref(params.attrs_idx),
-        1,
+        num_attrs,
         ctypes.byref(params.fail_idx),
         params.stream_handle,
     )
     if err != 0:
         raise RuntimeError(
-            f"cuMemcpyBatchAsync failed: err={err} failIdx={params.fail_idx.value}"
+            f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
         )
+
+
+def copy_blocks(
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    params: BatchMemcpyParams,
+) -> None:
+    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync.
+
+    Thin prepare+submit wrapper kept for compatibility; callers that need
+    DMA-only timing should call `prepare_copy_blocks`/`submit_prepared_copy`
+    directly so host-side NumPy prep is excluded from the timed region.
+    """
+    prepared = prepare_copy_blocks(src_block_ids, dst_block_ids, params)
+    if prepared is None:
+        return
+    submit_prepared_copy(prepared, params)
